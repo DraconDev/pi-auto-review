@@ -1,117 +1,164 @@
-# pi-auto-review Audit Report
+# pi-auto-review Audit Report v2
 
 **Date:** 2026-05-18  
-**Version:** 1.6.0 → 1.7.1 (in progress)  
-**Auditor:** Automated audit
+**Version:** 1.7.1 (commit a252df4)  
+**Auditor:** Automated full audit
 
 ---
 
 ## Executive Summary
 
-| Category | Count | Status |
+| Severity | Count | Status |
 |----------|-------|--------|
-| Critical | 2 | ✅ Fixed |
-| Warnings | 4 | 3 Fixed, 1 Documented |
-| Info | 5 | 4 Fixed, 1 Documented |
-| Good Practices | 9 | ✅ Maintained |
+| 🔴 Critical | 0 | — |
+| 🟡 Warning | 5 | See below |
+| 🔵 Info | 7 | See below |
+| ✅ Good | 6 | Noted |
 
-**Verdict:** ✅ All audit findings addressed.
-
----
-
-## Critical Issues — FIXED
-
-### ✅ C1: Test Coverage Added
-
-**Previously:** `"test": "echo 'No tests yet'"`
-
-**Resolution:**
-- Added `vitest` with 31 passing tests
-- Tests cover: TODO.md parsing, sentinel detection, Ralph completion detection, cycleState machine, fix loop convergence, cooldown mechanism, settings defaults
-
-### ✅ C2: Lint Configuration Added
-
-**Previously:** `"lint": "echo 'No linter configured yet'"`
-
-**Resolution:**
-- Added `eslint` + `@typescript-eslint` configuration
-- Strict type checking enabled
-- Run with `npm run lint`
+**Verdict:** Project is healthy. No critical issues. Warnings are about dependency cleanup, test coverage depth, and architecture.
 
 ---
 
-## Warnings — FIXED OR DOCUMENTED
+## Warnings (5)
 
-### ✅ W2: Ralph Detection Documented
+### W1: Unused/redundant devDependencies
 
-**Resolution:** Added JSDoc to `isRalphCompletion()` documenting the `<promise>COMPLETE</promise>` dependency.
+**Location:** `package.json` devDependencies
 
-### ⚠️ W1: cycleState Race Condition (Documented, Not Fixed)
+**Description:** 
+- `@eslint/js` is installed but **never imported** in `eslint.config.ts`. The config was simplified during setup and no longer uses `js.configs.recommended`.
+- `typescript-eslint` is a meta-package that bundles `@typescript-eslint/eslint-plugin` and `@typescript-eslint/parser`. Having all three is redundant — `typescript-eslint` alone suffices, OR the individual packages suffice without `typescript-eslint`.
 
-**Status:** Known limitation
+**Fix:**
+```bash
+# Option A: Remove unused deps
+npm uninstall @eslint/js typescript-eslint
 
-**Reason:** Low risk given Pi's event model. No locking mechanism added.
-
-### ✅ W4: TODO.md Syntax Documented
-
-**Resolution:** Added JSDoc to `countUnfixedItems()` documenting the `- [ ]` syntax requirement (GFM only).
-
-### ✅ W3: Sentinel Logging
-
-**Resolution:** The sentinel approach is documented via the inline comments.
+# Option B: Use typescript-eslint as the sole source (simpler)
+npm uninstall @eslint/js @typescript-eslint/eslint-plugin @typescript-eslint/parser
+# Then update eslint.config.ts to import from typescript-eslint only
+```
 
 ---
 
-## Info — FIXED OR DOCUMENTED
+### W2: Tests replicate logic inline instead of importing from extension
 
-### ✅ I2: Git Tags Added
+**Location:** `tests/auto-review.test.ts`
 
-**Resolution:** Added `v1.6.0` and `v1.7.0` annotated tags.
+**Description:** The 31 tests copy-paste the logic from the extension (e.g., `countUnfixedItems` regex, `isRalphCompletion` function) rather than importing and testing the actual functions. This means:
+- If the extension logic changes, the tests won't catch it
+- Tests verify what the code *should* do, not what it *actually* does
 
-### ✅ I4: JSDoc on Functions
+**Fix:** Extract pure functions from the extension and import them in tests. Requires either:
+1. Making internal functions exportable (e.g., `export function countUnfixedItems(...)`)
+2. Or testing through the extension API (mock `ExtensionAPI`)
 
-**Resolution:** Added comprehensive JSDoc to `isRalphCompletion()` and `countUnfixedItems()`.
+---
 
-### ℹ️ I1: Version/Commit Message Mismatch
+### W3: Event handlers have zero test coverage
 
-**Status:** Intentional per v1.7.0 commit message.
+**Location:** `extensions/auto-review.ts` — `pi.on("session_start")`, `pi.on("turn_end")`, `pi.on("agent_end")`, `pi.on("before_agent_start")`
 
-### ℹ️ I5: Settings Cache Staleness
+**Description:** The 4 event handlers that wire up the entire extension behavior have no tests. The cycleState machine, cooldown, and trigger logic are tested in isolation but not through the actual event handler paths.
 
-**Status:** Documented behavior — cache invalidates on session_start.
+**Fix:** Mock `ExtensionAPI` and test event handler flows end-to-end:
+```typescript
+const mockPi = { on: vi.fn(), sendUserMessage: vi.fn() };
+// Call the extension setup, then trigger events via mockPi.on callbacks
+```
 
-### ℹ️ I3: Console Statements
+---
 
-**Status:** Accepted — 10 console.log/warn statements for debugging.
+### W4: Exported function is 169 lines — monolithic
+
+**Location:** `extensions/auto-review.ts` — `export default function (pi: ExtensionAPI)`
+
+**Description:** The entire extension is one exported function containing all event handlers, state, and logic. This makes it hard to test individual parts and increases cognitive load.
+
+**Fix:** Extract into modules:
+- `settings.ts` — `getSettings()`, `readSettingsJson()`, defaults
+- `prompts.ts` — `buildReviewPrompt()`, `buildRereviewPrompt()`
+- `parsing.ts` — `countUnfixedItems()`
+- `detection.ts` — `isRalphCompletion()`
+- `extension.ts` — just the wiring (thin shell)
+
+---
+
+### W5: `.gitignore` missing `coverage/` and `.ralph/`
+
+**Location:** `.gitignore`
+
+**Description:** The `.gitignore` is managed by dracon-warden and doesn't include `coverage/` (vitest output) or `.ralph/` (Ralph loop state files). Both are currently tracked in git.
+
+**Note:** Cannot modify directly — dracon-warden managed block. Add a project-level override or request warden update.
+
+---
+
+## Info (7)
+
+### I1: 8 console statements in production code
+**Location:** `extensions/auto-review.ts`  
+Appropriate for an extension (debug logging), but consider a `DEBUG` env var to silence them.
+
+### I2: 3 module-level `let` variables for caching
+**Location:** `extensions/auto-review.ts` — `_cachedSettings`, `_cachedSettingsPath`, `_cachedMtimeKey`  
+Standard pattern for settings caching. Fine as-is.
+
+### I3: No async patterns (0 await, 0 .then)
+**Location:** `extensions/auto-review.ts`  
+The extension is fully synchronous. This is correct since all operations (fs.readFileSync, string matching) are fast and the Pi event model handles them synchronously.
+
+### I4: tsconfig doesn't include test files
+**Location:** `tsconfig.json` — `include: ["extensions/**/*.ts"]`  
+Tests have their own TypeScript context via vitest. This is standard — vitest handles test file compilation.
+
+### I5: `.ralph/` state files tracked in git
+Two Ralph loop state files (`.ralph/audit-fix-loop.md`, `.ralph/audit-fix-loop.state.json`) are committed. These are ephemeral and shouldn't be tracked.
+
+### I6: `@vitest/ui` installed but never used
+**Location:** `package.json` devDependencies  
+Only needed for `npm run test:ui`. Not harmful, but unnecessary if no one uses the UI.
+
+### I7: `1` explicit `any` in code (false positive)
+**Location:** `extensions/auto-review.ts`  
+The `any` match is in the REVIEW_METHODOLOGY prompt string (`"explicit any types (: any, as any)"`), not actual code. No real `any` usage in the TypeScript.
+
+---
+
+## Good (6)
+
+- ✅ No FIXME/HACK/TODO markers in code
+- ✅ 5 try/catch blocks for error handling
+- ✅ All settings documented in README
+- ✅ tsconfig strict mode enabled
+- ✅ Test script configured (`vitest run`)
+- ✅ Lint script configured (`eslint extensions/**/*.ts`)
+- ✅ No security vulnerabilities (`npm audit` clean)
+- ✅ TypeScript compiles without errors
+- ✅ ESLint passes
+- ✅ 31 tests pass
 
 ---
 
 ## Verification
 
-```bash
-npm run check  # TypeScript: ✅
-npm run lint   # ESLint: ✅
-npm test       # 31 tests: ✅
+```
+$ npm run check    # ✅ TypeScript: 0 errors
+$ npm run lint     # ✅ ESLint: 0 errors, 0 warnings
+$ npm test         # ✅ 31 tests pass
+$ npm audit        # ✅ 0 vulnerabilities
 ```
 
 ---
 
-## Previously Fixed in v1.7.0
+## Recommendations (Priority Order)
 
-| ID | Issue | Resolution |
-|----|-------|------------|
-| F1 | Agent-visible markers | Null-byte sentinels |
-| F2 | Status messages in prompts | Removed |
-| F3 | countUnfixedItems edge case | Returns 0 for missing file |
-| F4 | No error handling | try/catch with state rollback |
-
----
-
-## Files Changed
-
-- `vitest.config.ts` — new
-- `eslint.config.ts` — new
-- `tests/auto-review.test.ts` — new (31 tests)
-- `package.json` — updated scripts
-- `extensions/auto-review.ts` — JSDoc additions, `_` prefix on unused params
-- `AUDIT.md` — updated with resolution status
+| # | Priority | Item | Effort |
+|---|----------|------|--------|
+| 1 | P1 | Remove unused deps (`@eslint/js`, `typescript-eslint` OR individual `@typescript-eslint/*`) | Low |
+| 2 | P2 | Extract pure functions from extension for testability | Medium |
+| 3 | P2 | Add event handler tests with mocked ExtensionAPI | Medium |
+| 4 | P3 | Add `coverage/` and `.ralph/` to .gitignore (or request warden update) | Low |
+| 5 | P3 | Remove `.ralph/` state files from git tracking | Low |
+| 6 | P4 | Refactor monolithic export into modules | High |
+| 7 | P4 | Remove `@vitest/ui` if unused | Low |
