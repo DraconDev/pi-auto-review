@@ -185,31 +185,50 @@ If `autoFix: true` or `/review fix` was used:
 - Changes to public APIs
 - Anything you're not confident about
 
-## Step 10: Verification (after auto-fix)
+## Step 10: Fix Loop (when autoFix is enabled)
 
-If `verify: true` (default) and fixes were applied, a verification pass runs automatically.
-
-The verification prompt uses a different marker (`[pi-auto-review-verify]`) so the extension knows this is NOT a new review — it won't trigger another cycle.
-
-**Verification only does these things:**
-1. Read TODO.md
-2. For each `[x]` item: confirm the fix actually works (run build, run tests, check the code)
-3. If a claimed fix didn't work: change `[x]` back to `[ ]` and add ⚠️
-4. Add a "Verified: YYYY-MM-DD" line under the header
-5. **Do NOT add new items.** Do NOT fix anything. Just verify.
-
-**Why verification matters:** auto-fix sometimes introduces new breakage while fixing the original issue. Verification catches that.
-
-### The cycle never loops
+When `autoFix: true`, the extension runs a bounded fix loop:
 
 ```
-IDLE → REVIEWING → FIXING → VERIFYING → IDLE
-                                        ↑
-                                   back to idle, no re-trigger
+review → fix → re-review → fix → re-review (clean) → done ✅
 ```
 
-The extension's state machine prevents the verification pass from triggering
-another review. Only real non-review work can start a new cycle.
+### How it works
+
+1. **Review** — scan, write TODO.md with `Items found: N`
+2. **Fix** — agent works through items, crossing them off
+3. **Re-review** — extension reads TODO.md, counts remaining `[ ]` items
+4. **Decision:**
+   - 0 items remaining → **done**, project is clean ✅
+   - More items than before → **bail**, fixes are diverging ⚠️
+   - Round < maxFixRounds → **loop**, re-review and fix again
+   - Round >= maxFixRounds → **stop**, cap reached
+
+### Convergence detection
+
+The extension compares item counts between rounds:
+- Round 1 found 8 → fix → Round 2 found 3 → **converging** → fix → Round 3 found 0 → ✅ clean
+- Round 1 found 5 → fix → Round 2 found 7 → **diverging** → bail immediately
+
+If fixes are making things worse, the loop stops.
+
+### maxFixRounds
+
+Default: 3. The absolute cap on review→fix loops. Even if converging,
+we stop after this many rounds to prevent runaway costs.
+
+### The loop never triggers itself from outside
+
+The fix loop only happens when `autoFix: true` is set. The re-review
+uses `[pi-auto-review-rereview]` marker so `agent_end` knows it's part
+of the cycle, not real work. Only real non-review work can start a
+new independent review cycle.
+
+```
+IDLE → REVIEWING → FIXING → REVIEWING → FIXING → IDLE
+  ↑       (round 1)         (round 2)          │
+  └────────────── next real work event ──────────┘
+```
 
 ## Review Checklist
 

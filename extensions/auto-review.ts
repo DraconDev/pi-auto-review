@@ -2,7 +2,8 @@
  * Auto Review Extension for Pi
  *
  * Event-driven project review: scans for problems after work completes,
- * writes findings to TODO.md, and optionally auto-fixes them.
+ * writes findings to TODO.md, and optionally auto-fixes them in bounded
+ * loops until the project is clean.
  *
  * PRIMARY TRIGGERS (automatic):
  *   - Ralph loop completion  (detects COMPLETE marker in agent_end)
@@ -12,17 +13,16 @@
  * MANUAL OVERRIDE:
  *   /review [staged|diff|fix|verify]
  *
- * CYCLE:
- *   IDLE → REVIEWING → (if autoFix) FIXING → VERIFYING → IDLE
- *   IDLE → REVIEWING → (if no autoFix) IDLE
- *
- *   The review cycle NEVER re-triggers itself. Only real work (non-review
- *   agent_end) can start a new cycle.
+ * FIX LOOP (when autoFix is enabled):
+ *   review → fix → re-review → fix → re-review (clean) → done
+ *   Bounded by maxFixRounds (default 3).
+ *   Bails if diverging (new review finds more items than previous).
+ *   Stops immediately if review finds 0 items (project is clean).
  *
  * Settings (in .pi/settings.json or ~/.pi/agent/settings.json):
  *   autoReview.todoPath          - path to todo file (default: "TODO.md")
  *   autoReview.autoFix           - after writing todos, go fix them (default: false)
- *   autoReview.verify            - after auto-fix, run verification pass (default: true)
+ *   autoReview.maxFixRounds      - max review→fix→re-review loops (default: 3)
  *   autoReview.onRalphDone       - auto-review when Ralph loop completes (default: true)
  *   autoReview.onAgentEnd        - auto-review after any agent_end (default: false)
  *   autoReview.onSessionStart    - auto-review on session start (default: false)
@@ -30,7 +30,7 @@
  *   autoReview.prompt            - custom review prompt (default: null)
  *   autoReview.scope             - "full" | "staged" | "diff" (default: "full")
  *   autoReview.excludePatterns   - dirs to exclude (default: ["node_modules", ...])
- *   autoReview.cooldownMs       - minimum ms between auto-reviews (default: 120000 = 2 min)
+ *   autoReview.cooldownMs       - minimum ms between auto-reviews (default: 120000)
  */
 
 import * as fs from "node:fs";
@@ -40,17 +40,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-/** Unique marker injected into review prompts for reliable detection */
+/** Marker in initial and re-review prompts */
 const REVIEW_MARKER = "[pi-auto-review]";
-/** Marker for verification prompts (lighter, no re-trigger) */
-const VERIFY_MARKER = "[pi-auto-review-verify]";
+/** Marker in re-review prompts (so we know it's a loop iteration, not first pass) */
+const REREVIEW_MARKER = "[pi-auto-review-rereview]";
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 	todoPath: "TODO.md",
 	autoFix: false,
-	verify: true,
+	maxFixRounds: 3,
 	onRalphDone: true,
 	onAgentEnd: false,
 	onSessionStart: false,
@@ -78,7 +78,7 @@ const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 interface AutoReviewSettings {
 	todoPath?: string;
 	autoFix?: boolean;
-	verify?: boolean;
+	maxFixRounds?: number;
 	onRalphDone?: boolean;
 	onAgentEnd?: boolean;
 	onSessionStart?: boolean;
@@ -92,17 +92,19 @@ interface AutoReviewSettings {
 type ReviewScope = "full" | "staged" | "diff";
 
 /**
- * State machine for the review cycle.
+ * State machine for the review/fix cycle.
  *
- * IDLE        → normal work happening, triggers are armed
- * REVIEWING   → review prompt sent, waiting for agent to finish scanning
- * FIXING      → auto-fix in progress (agent is working through TODO items)
- * VERIFYING   → post-fix verification pass running
+ * IDLE        → normal work, triggers armed
+ * REVIEWING   → scan for problems (round 1, or re-review in a fix loop)
+ * FIXING      → auto-fix in progress
  *
- * Only transitions back to IDLE after the full cycle completes.
- * While in REVIEWING/FIXING/VERIFYING, no new auto-reviews can trigger.
+ * When fixing finishes in a fix loop:
+ *   - If round < maxFixRounds → re-review (REVIEWING again)
+ *   - If round >= maxFixRounds → IDLE (cap reached)
+ *   - If re-review finds 0 items → IDLE (project clean)
+ *   - If re-review finds MORE items → IDLE (diverging, bail)
  */
-type CycleState = "idle" | "reviewing" | "fixing" | "verifying";
+type CycleState = "idle" | "reviewing" | "fixing";
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
@@ -187,22 +189,37 @@ Write your findings to ${settings.todoPath}. Organize by priority:
 - 🟡 Warning — failing tests, dead code, deprecation issues
 - 🟢 Info — minor fixes, cleanup of accidental issues
 
+At the very end of ${settings.todoPath}, add a line: _Items found: N_ where N is the total count of unfixed [ ] items.
 Keep each item actionable and specific. Include file paths and line numbers where possible.
 Do NOT add feature requests, architecture proposals, or "nice to have" items.${autoFixInstruction}`;
 }
 
-function buildVerifyPrompt(settings: Required<AutoReviewSettings>): string {
-	return `${VERIFY_MARKER} Post-fix verification: check that the auto-fix changes actually resolved the issues in ${settings.todoPath}.
+function buildRereviewPrompt(
+	settings: Required<AutoReviewSettings>,
+	round: number,
+	maxRounds: number,
+	previousItemCount: number,
+): string {
+	const roundLabel = `round ${round}/${maxRounds}`;
 
-This is a VERIFICATION pass, not a new full review. Do NOT scan for new problems. ONLY:
-1. Read ${settings.todoPath}
-2. For each item marked [x] (claimed fixed): verify the fix actually works (run build, run tests, check the code)
-3. For each item still [ ] (unfixed): note it remains unfixed
-4. If a claimed fix didn't work: change [x] back to [ ] and add a ⚠️ note
-5. Remove items that are confirmed fixed and no longer relevant
+	return `${REREVIEW_MARKER} Re-review after fixes (${roundLabel}). The previous review found ${previousItemCount} items and fixes were applied.
 
-Update ${settings.todoPath} with the verification results. Add a "Verified: YYYY-MM-DD" line under the header.
-Do NOT add new review items. Do NOT fix anything. Just verify.`;
+Re-scan the project for remaining problems. This is a FIX-ONLY review just like the first pass.
+
+Use the /skill:auto-review skill for the review methodology.
+
+IMPORTANT:
+- Check if the fixes from the previous round actually resolved the claimed issues
+- Look for NEW problems that the fixes may have introduced
+- If a previous fix didn't work, mark it clearly in ${settings.todoPath}
+
+Write your findings to ${settings.todoPath}. Same format:
+- 🔴 Critical / 🟡 Warning / 🟢 Info
+- At the very end, add: _Items found: N_ where N is total unfixed [ ] items
+
+If you find ZERO problems, write an empty TODO.md with just a header saying "Project is clean ✅".
+
+Do NOT propose features. Only problems that need fixing.`;
 }
 
 // ── Ralph Detection ─────────────────────────────────────────────────────────
@@ -220,7 +237,7 @@ function isRalphCompletion(messages: Array<{ role: string; content?: string; too
 }
 
 /**
- * Detect if the agent just completed a review/fix/verify cycle
+ * Detect if agent just finished review/fix/rereview work
  * by checking messages for our markers.
  */
 function isReviewCycleMessage(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
@@ -228,9 +245,37 @@ function isReviewCycleMessage(messages: Array<{ role: string; content?: string; 
 		const msg = messages[i];
 		if (!msg) continue;
 		const text = typeof msg.content === "string" ? msg.content : "";
-		if (text.includes(REVIEW_MARKER) || text.includes(VERIFY_MARKER)) return true;
+		if (text.includes(REVIEW_MARKER) || text.includes(REREVIEW_MARKER)) return true;
 	}
 	return false;
+}
+
+/**
+ * Count unfixed items in TODO.md by reading the file and counting `[ ]` lines.
+ * Returns -1 if file doesn't exist or can't be read.
+ */
+function countUnfixedItems(todoPath: string, cwd: string): number {
+	const fullPath = path.resolve(cwd, todoPath);
+	try {
+		const content = fs.readFileSync(fullPath, "utf-8");
+		const matches = content.match(/^- \[ \]/gm);
+		return matches ? matches.length : 0;
+	} catch {
+		return -1;
+	}
+}
+
+/**
+ * Check if TODO.md says "Project is clean" — meaning 0 items found.
+ */
+function isProjectClean(todoPath: string, cwd: string): boolean {
+	const fullPath = path.resolve(cwd, todoPath);
+	try {
+		const content = fs.readFileSync(fullPath, "utf-8");
+		return content.includes("Project is clean") || content.includes("Items found: 0");
+	} catch {
+		return false;
+	}
 }
 
 // ── Extension ────────────────────────────────────────────────────────────────
@@ -244,6 +289,10 @@ export default function (pi: ExtensionAPI) {
 	let turnCount = 0;
 	// Whether autoFix was requested for the current cycle
 	let cycleAutoFix = false;
+	// Fix loop tracking: which round we're on
+	let fixRound = 0;
+	// How many items the previous review found (for convergence check)
+	let previousItemCount = -1;
 
 	function shouldTrigger(settings: Required<AutoReviewSettings>): boolean {
 		if (cycleState !== "idle") return false;
@@ -263,10 +312,77 @@ export default function (pi: ExtensionAPI) {
 
 		cycleState = "reviewing";
 		cycleAutoFix = autoFix;
+		fixRound = 0;
+		previousItemCount = -1;
 		lastAutoReviewTime = Date.now();
 
 		const prompt = buildReviewPrompt(settings, scope, autoFix, reason);
 		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+	}
+
+	/**
+	 * After a review+fix round completes, decide whether to re-review or stop.
+	 */
+	function handleFixRoundComplete(pi: ExtensionAPI, settings: Required<AutoReviewSettings>, ctx: { cwd: string; hasUI: boolean }) {
+		const currentItemCount = countUnfixedItems(settings.todoPath, ctx.cwd);
+
+		// ── Clean project → done! ────────────────────────────────────
+		if (currentItemCount === 0 || isProjectClean(settings.todoPath, ctx.cwd)) {
+			cycleState = "idle";
+			if (ctx.hasUI) {
+				pi.sendUserMessage("🔍 Auto-review: project is clean ✅", { deliverAs: "followUp" });
+			}
+			return;
+		}
+
+		fixRound++;
+
+		// ── Hit max rounds → stop ───────────────────────────────────
+		if (fixRound >= settings.maxFixRounds) {
+			cycleState = "idle";
+			if (ctx.hasUI) {
+				pi.sendUserMessage(
+					`🔍 Auto-review: reached max fix rounds (${settings.maxFixRounds}). ${currentItemCount} items remain in ${settings.todoPath}.`,
+					{ deliverAs: "followUp" },
+				);
+			}
+			return;
+		}
+
+		// ── Diverging (more items than before) → bail ────────────────
+		if (previousItemCount >= 0 && currentItemCount > previousItemCount) {
+			cycleState = "idle";
+			if (ctx.hasUI) {
+				pi.sendUserMessage(
+					`🔍 Auto-review: diverging (${currentItemCount} items now vs ${previousItemCount} before). Stopping fix loop — fixes may be causing new problems. ${currentItemCount} items remain in ${settings.todoPath}.`,
+					{ deliverAs: "followUp" },
+				);
+			}
+			return;
+		}
+
+		// ── Converging → re-review ───────────────────────────────────
+		previousItemCount = currentItemCount;
+		cycleState = "reviewing";
+
+		const rereviewPrompt = buildRereviewPrompt(settings, fixRound, settings.maxFixRounds, currentItemCount);
+
+		// In the fix loop, the re-review also tells the agent to fix
+		if (cycleAutoFix) {
+			// The rereview prompt doesn't include fix instructions by default,
+			// but in a fix loop we want to keep fixing. Append fix instruction.
+			const fixAppend = `\n\nAfter updating ${settings.todoPath}, fix the remaining problems. Cross off items as you fix them.`;
+			pi.sendUserMessage(rereviewPrompt + fixAppend, { deliverAs: "followUp" });
+		} else {
+			pi.sendUserMessage(rereviewPrompt, { deliverAs: "followUp" });
+		}
+
+		if (ctx.hasUI) {
+			pi.sendUserMessage(
+				`🔍 Fix loop round ${fixRound}/${settings.maxFixRounds} — ${currentItemCount} items remaining, re-reviewing`,
+				{ deliverAs: "followUp" },
+			);
+		}
 	}
 
 	// ── Session Start ────────────────────────────────────────────────────
@@ -274,6 +390,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		turnCount = 0;
 		cycleState = "idle";
+		fixRound = 0;
+		previousItemCount = -1;
 		const settings = getSettings(ctx.cwd);
 
 		if (settings.onSessionStart && shouldTrigger(settings)) {
@@ -291,10 +409,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ── Agent End — the primary event-driven trigger ─────────────────────
-	//
-	// Two responsibilities:
-	//   1. Detect real work completion (Ralph, long agent run) → start review
-	//   2. Detect review cycle completion → advance state machine
 
 	pi.on("agent_end", async (event, ctx) => {
 		const settings = getSettings(ctx.cwd);
@@ -304,79 +418,47 @@ export default function (pi: ExtensionAPI) {
 			toolName?: string;
 		}>;
 
-		// ── If we're in the review cycle, handle state transitions ──────
+		// ── Review cycle transitions ──────────────────────────────────
 
 		if (cycleState === "reviewing") {
-			// Review just finished.
-			// If autoFix was requested, the review prompt told the agent to fix
-			// things. The agent may have done review + fix in one pass, or
-			// just the review. Either way, if autoFix was on, transition to
-			// fixing state; if verify is on, we'll verify after fixing.
+			// Count items found by this review
+			const currentItemCount = countUnfixedItems(settings.todoPath, ctx.cwd);
+			previousItemCount = currentItemCount;
+
 			if (cycleAutoFix) {
+				// The review prompt included fix instructions.
+				// The agent did review + fix in one pass.
+				// Now decide: re-review or done?
 				cycleState = "fixing";
-				// The fix work is happening within the same agent_end or
-				// will be the next agent prompt. We'll detect when fixing
-				// is done by the NEXT agent_end that isn't part of the
-				// review cycle.
+				// handleFixRoundComplete will be called on the NEXT agent_end
+				// (the fix work is part of the same agent session, so this
+				// agent_end covers both review and fix)
 				//
-				// Actually: the review prompt with autoFix causes the agent
-				// to do review + fix in ONE agent session. When that
-				// session ends (this agent_end), both are done. So transition
-				// straight to verifying if configured.
-				if (settings.verify) {
-					cycleState = "verifying";
-					const verifyPrompt = buildVerifyPrompt(settings);
-					pi.sendUserMessage(verifyPrompt, { deliverAs: "followUp" });
-					if (ctx.hasUI) {
-						ctx.ui.notify("✅ Fixes applied — running verification pass", "info");
-					}
-				} else {
-					cycleState = "idle";
-					if (ctx.hasUI) {
-						ctx.ui.notify("✅ Review + fixes complete", "info");
-					}
-				}
+				// Actually: in Pi, a single agent session can span many turns.
+				// The review+fix happens within one agent_start→agent_end.
+				// So when we get here, both review and fix are done.
+				// Decide right now whether to loop.
+				handleFixRoundComplete(pi, settings, ctx);
 			} else {
-				// No autoFix — review is done, back to idle
+				// No autoFix — just a review. Done.
 				cycleState = "idle";
 				if (ctx.hasUI) {
 					ctx.ui.notify("✅ Review complete", "info");
 				}
 			}
-			return; // Don't process triggers for review-cycle agent_ends
+			return;
 		}
 
 		if (cycleState === "fixing") {
-			// Fix work finished. Start verification if configured.
-			if (settings.verify) {
-				cycleState = "verifying";
-				const verifyPrompt = buildVerifyPrompt(settings);
-				pi.sendUserMessage(verifyPrompt, { deliverAs: "followUp" });
-				if (ctx.hasUI) {
-					ctx.ui.notify("✅ Fixes applied — running verification pass", "info");
-				}
-			} else {
-				cycleState = "idle";
-				if (ctx.hasUI) {
-					ctx.ui.notify("✅ Review + fixes complete", "info");
-				}
-			}
+			// Fix work finished. Decide whether to re-review.
+			handleFixRoundComplete(pi, settings, ctx);
 			return;
 		}
 
-		if (cycleState === "verifying") {
-			// Verification pass finished. Back to idle.
-			cycleState = "idle";
-			if (ctx.hasUI) {
-				ctx.ui.notify("✅ Review cycle complete (verified)", "info");
-			}
-			return;
-		}
-
-		// ── If we're idle, check for real-work triggers ────────────────
+		// ── If idle, check for real-work triggers ──────────────────────
 
 		// Never trigger a new review if the just-completed agent work
-		// was itself a review cycle (safety check)
+		// was itself part of a review cycle (safety net)
 		if (isReviewCycleMessage(messages)) return;
 
 		// Check Ralph completion
@@ -400,13 +482,12 @@ export default function (pi: ExtensionAPI) {
 	// ── /review command (manual override) ────────────────────────────────
 
 	pi.registerCommand("review", {
-		description: "Review project for problems and update TODO.md. Use: /review [staged|diff|fix|verify]",
+		description: "Review project for problems and update TODO.md. Use: /review [staged|diff|fix]",
 		getArgumentCompletions(prefix: string) {
 			const options = [
 				{ value: "staged", label: "staged", description: "Review only staged changes" },
 				{ value: "diff", label: "diff", description: "Review diff from main branch" },
-				{ value: "fix", label: "fix", description: "Review and auto-fix problems" },
-				{ value: "verify", label: "verify", description: "Verify recent fixes worked" },
+				{ value: "fix", label: "fix", description: "Review and auto-fix (loop until clean)" },
 			];
 			const filtered = options.filter((o) => o.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
@@ -414,20 +495,6 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const settings = getSettings(ctx.cwd);
 			const normalized = (args || "").trim().toLowerCase();
-
-			// /review verify — manual verification pass
-			if (normalized === "verify") {
-				const verifyPrompt = buildVerifyPrompt(settings);
-				cycleState = "verifying";
-				if (!ctx.isIdle()) {
-					pi.sendUserMessage(verifyPrompt, { deliverAs: "followUp" });
-					ctx.ui.notify("🔍 Verification queued (agent is busy)", "info");
-					return;
-				}
-				pi.sendUserMessage(verifyPrompt);
-				ctx.ui.notify("🔍 Verification pass started", "info");
-				return;
-			}
 
 			let scope: ReviewScope = settings.scope as ReviewScope;
 			let autoFix = settings.autoFix;
@@ -444,6 +511,8 @@ export default function (pi: ExtensionAPI) {
 			// Override state for manual trigger
 			cycleState = "reviewing";
 			cycleAutoFix = autoFix;
+			fixRound = 0;
+			previousItemCount = -1;
 			lastAutoReviewTime = Date.now();
 
 			if (!ctx.isIdle()) {
@@ -453,7 +522,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			pi.sendUserMessage(prompt);
-			ctx.ui.notify(`🔍 Review started (${scope}${autoFix ? " + auto-fix" : ""})`, "info");
+			ctx.ui.notify(`🔍 Review started (${scope}${autoFix ? " + auto-fix loop" : ""})`, "info");
 		},
 	});
 
@@ -463,19 +532,11 @@ export default function (pi: ExtensionAPI) {
 		const text = event.prompt || "";
 		const settings = getSettings(ctx.cwd);
 
-		if (text.includes(REVIEW_MARKER)) {
+		if (text.includes(REVIEW_MARKER) || text.includes(REREVIEW_MARKER)) {
 			return {
 				systemPrompt:
 					event.systemPrompt +
-					`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. The auto-review skill contains the methodology — load /skill:auto-review if needed. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info.`,
-			};
-		}
-
-		if (text.includes(VERIFY_MARKER)) {
-			return {
-				systemPrompt:
-					event.systemPrompt +
-					`\n\n[auto-review extension] This is a VERIFICATION pass — do NOT scan for new problems or fix anything. ONLY verify whether the fixes in ${settings.todoPath} actually resolved the issues. Update checkmarks and add verification notes.`,
+					`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. The auto-review skill contains the methodology — load /skill:auto-review if needed. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include a line: _Items found: N_ with the total count of unfixed [ ] items.`,
 			};
 		}
 	});
