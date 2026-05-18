@@ -4,14 +4,12 @@ Event-driven project review for [Pi](https://pi.dev) — automatically scans for
 
 ## The Point
 
-This isn't `/review` that you remember to run. It **fires automatically** when work finishes — after a Ralph loop completes, after the agent finishes a long session, or on session start. It finds what's broken and writes it to `TODO.md`. Strictly fixes, not features.
+This extension is **invisible to the agent**. There is no `/review` command, no skill, no way for the agent to invoke it. Reviews trigger automatically when configured conditions are met — the agent just receives a follow-up message and does the work without knowing where it came from.
 
 ## Install
 
 ```bash
 pi install /path/to/pi-auto-review
-# or publish to npm first:
-pi install npm:pi-auto-review
 ```
 
 ## How It Works
@@ -44,7 +42,6 @@ round 1: 5 items → fix → round 2: 7 items → ⚠️ diverging, bail
 | `onRalphDone` | `true` | Auto-review when a Ralph loop completes |
 | `onAgentEnd` | `false` | Auto-review after any agent finishes (after `minTurns`) |
 | `onSessionStart` | `false` | Auto-review when a session starts |
-| `/review` | always | Manual trigger anytime |
 
 The primary use case: **`onRalphDone: true`** (the default). After a Ralph loop finishes pushing features, auto-review catches what got broken and writes fix items to `TODO.md`.
 
@@ -84,19 +81,9 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 | `scope` | `"full"\|"staged"\|"diff"` | `"full"` | Review scope |
 | `excludePatterns` | `string[]` | `["node_modules", ...]` | Directories to skip |
 | `prompt` | `string\|null` | `null` | Custom first-review prompt (replaces default) |
-| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt in fix loop. Supports `{round}`, `{maxRounds}`, `{previousItems}`, `{focusAreas}` placeholders |
+| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt. Supports `{round}`, `{maxRounds}`, `{previousItems}`, `{focusAreas}` placeholders |
 | `fixInstruction` | `string\|null` | `null` | Custom instruction appended when autoFix is on |
 | `focusAreas` | `string[]\|null` | `null` | Override default list of things to look for |
-
-## Manual Commands
-
-| Command | Description |
-|---------|-------------|
-| `/review` | Full project review → writes TODO.md |
-| `/review staged` | Review only staged changes |
-| `/review diff` | Review diff from main branch |
-| `/review fix` | Review and auto-fix in a loop until clean |
-| `/review stop` | Stop any in-progress fix loop |
 
 ## Fix-Only Philosophy
 
@@ -131,37 +118,13 @@ All prompts are customizable. Use `null` or omit to keep defaults.
 }
 ```
 
-### rereviewPrompt placeholders
-
-| Placeholder | Replaced with |
-|-------------|-------------|
-| `{round}` | Current fix loop round (1, 2, 3...) |
-| `{maxRounds}` | `maxFixRounds` setting |
-| `{previousItems}` | Items found in previous round |
-| `{focusAreas}` | Resolved focus areas list (only if custom `focusAreas` is set) |
-
-## Customizing Focus Areas
-
-The default focus areas (when `focusAreas` is not set):
-
-- Lint errors, type errors, build failures
-- Failing or missing tests
-- Security vulnerabilities
-- Broken imports or missing dependencies
-- Dead code, unreachable branches
-- TODO/FIXME/HACK comments that indicate known BUGS (not feature ideas)
-- Inconsistencies between code and config
-- Performance problems that are bugs (N+1 queries, memory leaks)
-
-Override with `focusAreas: [...]` in settings.
-
 ## Cooldown
 
-Auto-reviews have a 2-minute cooldown by default (`cooldownMs: 120000`). This prevents review spam when multiple events fire close together (e.g., Ralph completes → agent_end fires right after).
+Auto-reviews have a 2-minute cooldown by default (`cooldownMs: 120000`). This prevents review spam when multiple events fire close together.
 
 ## `.pi/settings.json` — Git Strategy
 
-The `.pi/settings.json` file contains review configuration. It can be committed to share team settings, or kept local-only. If you want it local-only, add to `.gitignore`:
+The `.pi/settings.json` file can be committed to share team settings, or kept local-only. If local-only, add to `.gitignore`:
 
 ```
 TODO.md

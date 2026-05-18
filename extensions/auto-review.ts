@@ -5,6 +5,9 @@
  * writes findings to TODO.md, and optionally auto-fixes them in bounded
  * loops until the project is clean.
  *
+ * This extension is purely event-driven — there is no /review command.
+ * Reviews trigger automatically when configured conditions are met.
+ *
  * Settings (in .pi/settings.json or ~/.pi/agent/settings.json):
  *   autoReview.todoPath          - path to todo file (default: "TODO.md")
  *   autoReview.autoFix           - after writing todos, go fix them (default: false)
@@ -152,7 +155,7 @@ function getSettings(cwd: string): Required<AutoReviewSettings> {
 	return _cachedSettings;
 }
 
-// ── Review methodology (inline, no skill dependency) ───────────────────────
+// ── Review methodology (inline) ───────────────────────────────────────────
 
 const REVIEW_METHODOLOGY = `Use this FIX-ONLY review methodology:
 1. **Build check** — run the project's build command and type checker (e.g., npm run build && npx tsc --noEmit)
@@ -270,7 +273,7 @@ Do NOT propose features. Only problems that need fixing.${fixAppend}`;
 // ── Detection helpers ───────────────────────────────────────────────────────
 
 function isRalphCompletion(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
-	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i++) {
+	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i--) {
 		const msg = messages[i];
 		if (!msg) continue;
 		if (msg.role === "assistant" && typeof msg.content === "string") {
@@ -282,7 +285,7 @@ function isRalphCompletion(messages: Array<{ role: string; content?: string; too
 }
 
 function isReviewCycleMessage(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
-	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i++) {
+	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i--) {
 		const msg = messages[i];
 		if (!msg) continue;
 		const text = typeof msg.content === "string" ? msg.content : "";
@@ -331,7 +334,6 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function startReview(
-		pi: ExtensionAPI,
 		settings: Required<AutoReviewSettings>,
 		scope: ReviewScope,
 		autoFix: boolean,
@@ -349,17 +351,7 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 	}
 
-	function stopFixLoop(pi: ExtensionAPI, hasUI: boolean) {
-		const wasActive = cycleState !== "idle";
-		if (!wasActive) return;
-		cycleState = "idle";
-		if (hasUI) {
-			pi.sendUserMessage("🔍 Fix loop stopped by user.", { deliverAs: "followUp" });
-		}
-	}
-
 	function handleFixRoundComplete(
-		pi: ExtensionAPI,
 		settings: Required<AutoReviewSettings>,
 		cwd: string,
 		hasUI: boolean,
@@ -429,7 +421,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify("🔍 Auto-review triggered (session start)", "info");
 			}
-			startReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, "session start");
+			startReview(settings, settings.scope as ReviewScope, settings.autoFix, "session start");
 		}
 	});
 
@@ -454,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 			previousItemCount = currentItemCount;
 
 			if (cycleAutoFix) {
-				handleFixRoundComplete(pi, settings, ctx.cwd, ctx.hasUI);
+				handleFixRoundComplete(settings, ctx.cwd, ctx.hasUI);
 			} else {
 				cycleState = "idle";
 				if (ctx.hasUI) {
@@ -470,7 +462,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify("🔍 Ralph loop done — triggering auto-review", "info");
 			}
-			startReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
+			startReview(settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
 			return;
 		}
 
@@ -478,61 +470,8 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`🔍 Agent finished (${turnCount} turns) — triggering auto-review`, "info");
 			}
-			startReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
+			startReview(settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
 		}
-	});
-
-	// ── /review command ──────────────────────────────────────────────────
-
-	pi.registerCommand("review", {
-		description: "Review project for problems. Use: /review [staged|diff|fix] or /review stop",
-		getArgumentCompletions(prefix: string) {
-			const options = [
-				{ value: "staged", label: "staged", description: "Review only staged changes" },
-				{ value: "diff", label: "diff", description: "Review diff from main branch" },
-				{ value: "fix", label: "fix", description: "Review and auto-fix (loop until clean)" },
-				{ value: "stop", label: "stop", description: "Stop any in-progress fix loop" },
-			];
-			const filtered = options.filter((o) => o.value.startsWith(prefix));
-			return filtered.length > 0 ? filtered : null;
-		},
-		handler: async (args, ctx) => {
-			const normalized = (args || "").trim().toLowerCase();
-
-			if (normalized === "stop") {
-				stopFixLoop(pi, ctx.hasUI);
-				return;
-			}
-
-			const settings = getSettings(ctx.cwd);
-
-			let scope: ReviewScope = settings.scope as ReviewScope;
-			let autoFix = settings.autoFix;
-
-			if (normalized === "staged") scope = "staged";
-			else if (normalized === "diff") scope = "diff";
-			else if (normalized === "fix") {
-				scope = "full";
-				autoFix = true;
-			}
-
-			const prompt = buildReviewPrompt(settings, scope, autoFix, "manual /review command");
-
-			cycleState = "reviewing";
-			cycleAutoFix = autoFix;
-			fixRound = 0;
-			previousItemCount = -1;
-			lastAutoReviewTime = Date.now();
-
-			if (!ctx.isIdle()) {
-				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-				ctx.ui.notify("🔍 Review queued (agent is busy)", "info");
-				return;
-			}
-
-			pi.sendUserMessage(prompt);
-			ctx.ui.notify(`🔍 Review started (${scope}${autoFix ? " + auto-fix loop" : ""})`, "info");
-		},
 	});
 
 	// ── System prompt hints ─────────────────────────────────────────────
@@ -545,7 +484,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				systemPrompt:
 					event.systemPrompt +
-					`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. Methodology: build check (tsc --noEmit), test suite, grep for FIXME/HACK/console.log/: any, security scan (hardcoded secrets, eval), npm ls for dep health. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include a line: _Items found: N_ with the total count of unfixed [ ] items.`,
+					`\n\nThis is a fix-only review — do NOT propose features or improvements. Methodology: build check (tsc --noEmit), test suite, grep for FIXME/HACK/console.log/: any, security scan (hardcoded secrets, eval), npm ls for dep health. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include a line: _Items found: N_ with the total count of unfixed [ ] items.`,
 			};
 		}
 	});
