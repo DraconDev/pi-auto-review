@@ -199,7 +199,7 @@ function buildReviewPrompt(
 	settings: Required<AutoReviewSettings>,
 	scope: ReviewScope,
 	autoFix: boolean,
-	triggerReason: string,
+	_triggerReason: string,
 ): string {
 	// Custom prompt: prepend sentinel, always append format instruction
 	if (settings.prompt) {
@@ -284,6 +284,14 @@ Do NOT propose features. Only problems that need fixing.${fixAppend}`;
 
 // ── Detection helpers ───────────────────────────────────────────────────────
 
+/**
+ * Detects Ralph loop completion by looking for <promise>COMPLETE</promise>
+ * in the last 5 messages (assistant role with string content).
+ *
+ * @param messages - The message history array
+ * @returns true if Ralph loop completion is detected
+ * @requires Ralph loop output format: <promise>COMPLETE</promise>
+ */
 function isRalphCompletion(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
 	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i--) {
 		const msg = messages[i];
@@ -298,6 +306,11 @@ function isRalphCompletion(messages: Array<{ role: string; content?: string; too
 /**
  * Count unfixed [ ] items ONLY within the auto-generated section.
  * Returns 0 for missing files (not an error — just means no items yet).
+ *
+ * @param todoPath - Path to the TODO.md file
+ * @param cwd - Current working directory for path resolution
+ * @returns Count of unchecked items in the auto-review section
+ * @note Supports only `- [ ]` syntax (GitHub Flavored Markdown)
  */
 function countUnfixedItems(todoPath: string, cwd: string): number {
 	const fullPath = path.resolve(cwd, todoPath);
@@ -361,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 	function handleFixRoundComplete(
 		settings: Required<AutoReviewSettings>,
 		cwd: string,
-		hasUI: boolean,
+		_hasUI: boolean,
 	) {
 		const currentItemCount = countUnfixedItems(settings.todoPath, cwd);
 
