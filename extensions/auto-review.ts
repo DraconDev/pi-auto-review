@@ -10,11 +10,19 @@
  *   - session_start          (optional, for fresh session reviews)
  *
  * MANUAL OVERRIDE:
- *   /review [staged|diff|fix]
+ *   /review [staged|diff|fix|verify]
+ *
+ * CYCLE:
+ *   IDLE → REVIEWING → (if autoFix) FIXING → VERIFYING → IDLE
+ *   IDLE → REVIEWING → (if no autoFix) IDLE
+ *
+ *   The review cycle NEVER re-triggers itself. Only real work (non-review
+ *   agent_end) can start a new cycle.
  *
  * Settings (in .pi/settings.json or ~/.pi/agent/settings.json):
  *   autoReview.todoPath          - path to todo file (default: "TODO.md")
  *   autoReview.autoFix           - after writing todos, go fix them (default: false)
+ *   autoReview.verify            - after auto-fix, run verification pass (default: true)
  *   autoReview.onRalphDone       - auto-review when Ralph loop completes (default: true)
  *   autoReview.onAgentEnd        - auto-review after any agent_end (default: false)
  *   autoReview.onSessionStart    - auto-review on session start (default: false)
@@ -34,12 +42,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Unique marker injected into review prompts for reliable detection */
 const REVIEW_MARKER = "[pi-auto-review]";
+/** Marker for verification prompts (lighter, no re-trigger) */
+const VERIFY_MARKER = "[pi-auto-review-verify]";
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 	todoPath: "TODO.md",
 	autoFix: false,
+	verify: true,
 	onRalphDone: true,
 	onAgentEnd: false,
 	onSessionStart: false,
@@ -59,7 +70,7 @@ const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 		".venv",
 		"target",
 	],
-	cooldownMs: 120_000, // 2 minutes between auto-reviews
+	cooldownMs: 120_000,
 };
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -67,6 +78,7 @@ const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 interface AutoReviewSettings {
 	todoPath?: string;
 	autoFix?: boolean;
+	verify?: boolean;
 	onRalphDone?: boolean;
 	onAgentEnd?: boolean;
 	onSessionStart?: boolean;
@@ -79,10 +91,18 @@ interface AutoReviewSettings {
 
 type ReviewScope = "full" | "staged" | "diff";
 
-interface ParsedReviewArgs {
-	scope: ReviewScope;
-	autoFix: boolean;
-}
+/**
+ * State machine for the review cycle.
+ *
+ * IDLE        → normal work happening, triggers are armed
+ * REVIEWING   → review prompt sent, waiting for agent to finish scanning
+ * FIXING      → auto-fix in progress (agent is working through TODO items)
+ * VERIFYING   → post-fix verification pass running
+ *
+ * Only transitions back to IDLE after the full cycle completes.
+ * While in REVIEWING/FIXING/VERIFYING, no new auto-reviews can trigger.
+ */
+type CycleState = "idle" | "reviewing" | "fixing" | "verifying";
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
@@ -118,7 +138,7 @@ function getSettings(cwd: string): Required<AutoReviewSettings> {
 	return { ...DEFAULT_SETTINGS };
 }
 
-// ── Prompt Builder ──────────────────────────────────────────────────────────
+// ── Prompt Builders ─────────────────────────────────────────────────────────
 
 function buildReviewPrompt(
 	settings: Required<AutoReviewSettings>,
@@ -171,28 +191,44 @@ Keep each item actionable and specific. Include file paths and line numbers wher
 Do NOT add feature requests, architecture proposals, or "nice to have" items.${autoFixInstruction}`;
 }
 
+function buildVerifyPrompt(settings: Required<AutoReviewSettings>): string {
+	return `${VERIFY_MARKER} Post-fix verification: check that the auto-fix changes actually resolved the issues in ${settings.todoPath}.
+
+This is a VERIFICATION pass, not a new full review. Do NOT scan for new problems. ONLY:
+1. Read ${settings.todoPath}
+2. For each item marked [x] (claimed fixed): verify the fix actually works (run build, run tests, check the code)
+3. For each item still [ ] (unfixed): note it remains unfixed
+4. If a claimed fix didn't work: change [x] back to [ ] and add a ⚠️ note
+5. Remove items that are confirmed fixed and no longer relevant
+
+Update ${settings.todoPath} with the verification results. Add a "Verified: YYYY-MM-DD" line under the header.
+Do NOT add new review items. Do NOT fix anything. Just verify.`;
+}
+
 // ── Ralph Detection ─────────────────────────────────────────────────────────
 
-/**
- * Detect if a Ralph loop just completed by checking agent_end messages
- * for the Ralph COMPLETE marker or ralph_done tool calls.
- */
 function isRalphCompletion(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
 	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i--) {
 		const msg = messages[i];
 		if (!msg) continue;
-
-		// Check assistant messages for the completion marker
 		if (msg.role === "assistant" && typeof msg.content === "string") {
-			if (msg.content.includes("<promise>COMPLETE</promise>")) {
-				return true;
-			}
+			if (msg.content.includes("<promise>COMPLETE</promise>")) return true;
 		}
+		if (msg.toolName === "ralph_done") return true;
+	}
+	return false;
+}
 
-		// Check tool results for ralph_done
-		if (msg.toolName === "ralph_done") {
-			return true;
-		}
+/**
+ * Detect if the agent just completed a review/fix/verify cycle
+ * by checking messages for our markers.
+ */
+function isReviewCycleMessage(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
+	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i--) {
+		const msg = messages[i];
+		if (!msg) continue;
+		const text = typeof msg.content === "string" ? msg.content : "";
+		if (text.includes(REVIEW_MARKER) || text.includes(VERIFY_MARKER)) return true;
 	}
 	return false;
 }
@@ -200,21 +236,23 @@ function isRalphCompletion(messages: Array<{ role: string; content?: string; too
 // ── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// Cycle state machine
+	let cycleState: CycleState = "idle";
 	// Cooldown tracking
 	let lastAutoReviewTime = 0;
 	// Turn counter for agent_end threshold
 	let turnCount = 0;
-	// Whether a review is already in-flight (prevent re-triggering)
-	let reviewInFlight = false;
+	// Whether autoFix was requested for the current cycle
+	let cycleAutoFix = false;
 
 	function shouldTrigger(settings: Required<AutoReviewSettings>): boolean {
-		if (reviewInFlight) return false;
+		if (cycleState !== "idle") return false;
 		const now = Date.now();
 		if (now - lastAutoReviewTime < settings.cooldownMs) return false;
 		return true;
 	}
 
-	function triggerReview(
+	function startReview(
 		pi: ExtensionAPI,
 		settings: Required<AutoReviewSettings>,
 		scope: ReviewScope,
@@ -223,47 +261,26 @@ export default function (pi: ExtensionAPI) {
 	) {
 		if (!shouldTrigger(settings)) return;
 
-		reviewInFlight = true;
+		cycleState = "reviewing";
+		cycleAutoFix = autoFix;
 		lastAutoReviewTime = Date.now();
 
 		const prompt = buildReviewPrompt(settings, scope, autoFix, reason);
-
-		// Send as followUp to avoid interrupting any current work
 		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-
-		// Reset the in-flight flag after a generous timeout
-		setTimeout(() => {
-			reviewInFlight = false;
-		}, 60_000);
 	}
 
 	// ── Session Start ────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
 		turnCount = 0;
-		reviewInFlight = false;
+		cycleState = "idle";
 		const settings = getSettings(ctx.cwd);
 
 		if (settings.onSessionStart && shouldTrigger(settings)) {
-			lastAutoReviewTime = Date.now();
-			reviewInFlight = true;
-
-			const prompt = buildReviewPrompt(
-				settings,
-				settings.scope as ReviewScope,
-				settings.autoFix,
-				"session start",
-			);
-
-			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-
-			setTimeout(() => {
-				reviewInFlight = false;
-			}, 60_000);
-
 			if (ctx.hasUI) {
 				ctx.ui.notify("🔍 Auto-review triggered (session start)", "info");
 			}
+			startReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, "session start");
 		}
 	});
 
@@ -275,27 +292,100 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Agent End — the primary event-driven trigger ─────────────────────
 	//
-	// This fires after every agent prompt completes. We check:
-	//   1. Was this a Ralph loop completion?  → onRalphDone
-	//   2. Was this a long enough agent run?   → onAgentEnd (with minTurns)
+	// Two responsibilities:
+	//   1. Detect real work completion (Ralph, long agent run) → start review
+	//   2. Detect review cycle completion → advance state machine
 
 	pi.on("agent_end", async (event, ctx) => {
 		const settings = getSettings(ctx.cwd);
+		const messages = event.messages as Array<{
+			role: string;
+			content?: string;
+			toolName?: string;
+		}>;
+
+		// ── If we're in the review cycle, handle state transitions ──────
+
+		if (cycleState === "reviewing") {
+			// Review just finished.
+			// If autoFix was requested, the review prompt told the agent to fix
+			// things. The agent may have done review + fix in one pass, or
+			// just the review. Either way, if autoFix was on, transition to
+			// fixing state; if verify is on, we'll verify after fixing.
+			if (cycleAutoFix) {
+				cycleState = "fixing";
+				// The fix work is happening within the same agent_end or
+				// will be the next agent prompt. We'll detect when fixing
+				// is done by the NEXT agent_end that isn't part of the
+				// review cycle.
+				//
+				// Actually: the review prompt with autoFix causes the agent
+				// to do review + fix in ONE agent session. When that
+				// session ends (this agent_end), both are done. So transition
+				// straight to verifying if configured.
+				if (settings.verify) {
+					cycleState = "verifying";
+					const verifyPrompt = buildVerifyPrompt(settings);
+					pi.sendUserMessage(verifyPrompt, { deliverAs: "followUp" });
+					if (ctx.hasUI) {
+						ctx.ui.notify("✅ Fixes applied — running verification pass", "info");
+					}
+				} else {
+					cycleState = "idle";
+					if (ctx.hasUI) {
+						ctx.ui.notify("✅ Review + fixes complete", "info");
+					}
+				}
+			} else {
+				// No autoFix — review is done, back to idle
+				cycleState = "idle";
+				if (ctx.hasUI) {
+					ctx.ui.notify("✅ Review complete", "info");
+				}
+			}
+			return; // Don't process triggers for review-cycle agent_ends
+		}
+
+		if (cycleState === "fixing") {
+			// Fix work finished. Start verification if configured.
+			if (settings.verify) {
+				cycleState = "verifying";
+				const verifyPrompt = buildVerifyPrompt(settings);
+				pi.sendUserMessage(verifyPrompt, { deliverAs: "followUp" });
+				if (ctx.hasUI) {
+					ctx.ui.notify("✅ Fixes applied — running verification pass", "info");
+				}
+			} else {
+				cycleState = "idle";
+				if (ctx.hasUI) {
+					ctx.ui.notify("✅ Review + fixes complete", "info");
+				}
+			}
+			return;
+		}
+
+		if (cycleState === "verifying") {
+			// Verification pass finished. Back to idle.
+			cycleState = "idle";
+			if (ctx.hasUI) {
+				ctx.ui.notify("✅ Review cycle complete (verified)", "info");
+			}
+			return;
+		}
+
+		// ── If we're idle, check for real-work triggers ────────────────
+
+		// Never trigger a new review if the just-completed agent work
+		// was itself a review cycle (safety check)
+		if (isReviewCycleMessage(messages)) return;
 
 		// Check Ralph completion
-		if (settings.onRalphDone) {
-			const messages = event.messages as Array<{
-				role: string;
-				content?: string;
-				toolName?: string;
-			}>;
-			if (isRalphCompletion(messages)) {
-				if (ctx.hasUI) {
-					ctx.ui.notify("🔍 Ralph loop done — triggering auto-review", "info");
-				}
-				triggerReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
-				return; // Don't double-trigger
+		if (settings.onRalphDone && isRalphCompletion(messages)) {
+			if (ctx.hasUI) {
+				ctx.ui.notify("🔍 Ralph loop done — triggering auto-review", "info");
 			}
+			startReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
+			return;
 		}
 
 		// Check agent_end with minimum turn threshold
@@ -303,19 +393,20 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`🔍 Agent finished (${turnCount} turns) — triggering auto-review`, "info");
 			}
-			triggerReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
+			startReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
 		}
 	});
 
 	// ── /review command (manual override) ────────────────────────────────
 
 	pi.registerCommand("review", {
-		description: "Review project for problems and update TODO.md. Use: /review [staged|diff|fix]",
+		description: "Review project for problems and update TODO.md. Use: /review [staged|diff|fix|verify]",
 		getArgumentCompletions(prefix: string) {
 			const options = [
 				{ value: "staged", label: "staged", description: "Review only staged changes" },
 				{ value: "diff", label: "diff", description: "Review diff from main branch" },
 				{ value: "fix", label: "fix", description: "Review and auto-fix problems" },
+				{ value: "verify", label: "verify", description: "Verify recent fixes worked" },
 			];
 			const filtered = options.filter((o) => o.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
@@ -323,6 +414,20 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const settings = getSettings(ctx.cwd);
 			const normalized = (args || "").trim().toLowerCase();
+
+			// /review verify — manual verification pass
+			if (normalized === "verify") {
+				const verifyPrompt = buildVerifyPrompt(settings);
+				cycleState = "verifying";
+				if (!ctx.isIdle()) {
+					pi.sendUserMessage(verifyPrompt, { deliverAs: "followUp" });
+					ctx.ui.notify("🔍 Verification queued (agent is busy)", "info");
+					return;
+				}
+				pi.sendUserMessage(verifyPrompt);
+				ctx.ui.notify("🔍 Verification pass started", "info");
+				return;
+			}
 
 			let scope: ReviewScope = settings.scope as ReviewScope;
 			let autoFix = settings.autoFix;
@@ -336,6 +441,11 @@ export default function (pi: ExtensionAPI) {
 
 			const prompt = buildReviewPrompt(settings, scope, autoFix, "manual /review command");
 
+			// Override state for manual trigger
+			cycleState = "reviewing";
+			cycleAutoFix = autoFix;
+			lastAutoReviewTime = Date.now();
+
 			if (!ctx.isIdle()) {
 				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 				ctx.ui.notify("🔍 Review queued (agent is busy)", "info");
@@ -347,25 +457,26 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── System prompt hint for review prompts ───────────────────────────
+	// ── System prompt hints ─────────────────────────────────────────────
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const text = event.prompt || "";
-		if (!text.includes(REVIEW_MARKER)) return;
-
 		const settings = getSettings(ctx.cwd);
-		return {
-			systemPrompt:
-				event.systemPrompt +
-				`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. The auto-review skill contains the methodology — load /skill:auto-review if needed. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info.`,
-		};
-	});
 
-	// ── Reset in-flight flag when review agent ends ─────────────────────
+		if (text.includes(REVIEW_MARKER)) {
+			return {
+				systemPrompt:
+					event.systemPrompt +
+					`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. The auto-review skill contains the methodology — load /skill:auto-review if needed. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info.`,
+			};
+		}
 
-	pi.on("agent_end", async (_event, _ctx) => {
-		// The review prompt triggers its own agent_end; reset the flag
-		// so future auto-reviews can fire
-		reviewInFlight = false;
+		if (text.includes(VERIFY_MARKER)) {
+			return {
+				systemPrompt:
+					event.systemPrompt +
+					`\n\n[auto-review extension] This is a VERIFICATION pass — do NOT scan for new problems or fix anything. ONLY verify whether the fixes in ${settings.todoPath} actually resolved the issues. Update checkmarks and add verification notes.`,
+			};
+		}
 	});
 }

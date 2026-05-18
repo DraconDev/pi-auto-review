@@ -185,6 +185,32 @@ If `autoFix: true` or `/review fix` was used:
 - Changes to public APIs
 - Anything you're not confident about
 
+## Step 10: Verification (after auto-fix)
+
+If `verify: true` (default) and fixes were applied, a verification pass runs automatically.
+
+The verification prompt uses a different marker (`[pi-auto-review-verify]`) so the extension knows this is NOT a new review — it won't trigger another cycle.
+
+**Verification only does these things:**
+1. Read TODO.md
+2. For each `[x]` item: confirm the fix actually works (run build, run tests, check the code)
+3. If a claimed fix didn't work: change `[x]` back to `[ ]` and add ⚠️
+4. Add a "Verified: YYYY-MM-DD" line under the header
+5. **Do NOT add new items.** Do NOT fix anything. Just verify.
+
+**Why verification matters:** auto-fix sometimes introduces new breakage while fixing the original issue. Verification catches that.
+
+### The cycle never loops
+
+```
+IDLE → REVIEWING → FIXING → VERIFYING → IDLE
+                                        ↑
+                                   back to idle, no re-trigger
+```
+
+The extension's state machine prevents the verification pass from triggering
+another review. Only real non-review work can start a new cycle.
+
 ## Review Checklist
 
 Quick reference: [references/review-checklist.md](references/review-checklist.md)

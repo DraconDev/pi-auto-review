@@ -16,10 +16,23 @@ pi install npm:pi-auto-review
 
 ## How It Works
 
+```
+Ralph loop done → 🔍 auto-review → 📝 TODO.md → 🔧 auto-fix (optional) → ✅ verify (default)
+```
+
 1. **Work completes** (Ralph loop done, agent finishes, session starts)
 2. **Review triggers automatically** — scans the project for problems
 3. **TODO.md gets updated** with prioritized fix items
-4. **Optionally auto-fixes** — if configured, the agent then fixes the problems
+4. **Optionally auto-fixes** — if `autoFix: true`, the agent fixes the problems
+5. **Verification pass** — if `verify: true` (default), confirms the fixes actually worked
+
+### The cycle never loops
+
+```
+IDLE → REVIEWING → FIXING → VERIFYING → IDLE
+```
+
+Only real work (not review/fix/verify) can start a new cycle. No infinite loops.
 
 ## Triggers
 
@@ -41,6 +54,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
   "autoReview": {
     "todoPath": "TODO.md",
     "autoFix": false,
+    "verify": true,
     "onRalphDone": true,
     "onAgentEnd": false,
     "onSessionStart": false,
@@ -59,6 +73,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 |---------|------|---------|-------------|
 | `todoPath` | `string` | `"TODO.md"` | Path to the todo file |
 | `autoFix` | `boolean` | `false` | After building the todo, go fix the problems |
+| `verify` | `boolean` | `true` | After auto-fix, run a verification pass |
 | `onRalphDone` | `boolean` | `true` | Auto-review when Ralph loop completes |
 | `onAgentEnd` | `boolean` | `false` | Auto-review after agent finishes |
 | `onSessionStart` | `boolean` | `false` | Auto-review on session start |
@@ -76,6 +91,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 | `/review staged` | Review only staged changes |
 | `/review diff` | Review diff from main branch |
 | `/review fix` | Review and then auto-fix the problems |
+| `/review verify` | Run verification pass on existing TODO.md fixes |
 
 ## Fix-Only Philosophy
 
