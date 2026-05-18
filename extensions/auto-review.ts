@@ -110,8 +110,9 @@ function readSettingsJson(filePath: string): Record<string, unknown> | null {
 		}
 		return null;
 	} catch (err) {
-		if (fs.existsSync(filePath) && err instanceof SyntaxError) {
-			console.warn(`[auto-review] Warning: ${filePath} has invalid JSON — using defaults`);
+		if (fs.existsSync(filePath)) {
+			const detail = err instanceof Error ? err.message : String(err);
+			console.warn(`[auto-review] Warning: ${filePath} can't be read — ${detail}`);
 		}
 		return null;
 	}
@@ -200,9 +201,9 @@ function buildRereviewPrompt(
 	// Custom re-review prompt
 	if (settings.rereviewPrompt) {
 		let prompt = `${REREVIEW_MARKER} ${settings.rereviewPrompt}`
-			.replace("{round}", String(round))
-			.replace("{maxRounds}", String(maxRounds))
-			.replace("{previousItems}", String(previousItemCount));
+			.replaceAll("{round}", String(round))
+			.replaceAll("{maxRounds}", String(maxRounds))
+			.replaceAll("{previousItems}", String(previousItemCount));
 		if (autoFix) {
 			prompt += `\n\n${settings.fixInstruction ?? getDefaultFixInstruction(settings.todoPath)}`;
 		}
