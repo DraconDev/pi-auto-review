@@ -141,7 +141,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify("Review triggered (session start)", "info");
 			}
-			startReview(settings, settings.scope as ReviewScope, settings.autoFix, "session start");
+			startReview(settings, settings.scope, settings.autoFix, "session start");
 		}
 	});
 
@@ -163,9 +163,6 @@ export default function (pi: ExtensionAPI) {
 
 		// If we're in a review cycle, handle completion
 		if (cycleState === "reviewing") {
-			const currentItemCount = countUnfixedItems(settings.todoPath, ctx.cwd);
-			previousItemCount = currentItemCount;
-
 			if (cycleAutoFix) {
 				handleFixRoundComplete(settings, ctx.cwd, ctx.hasUI);
 			} else {
@@ -187,7 +184,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify("Review triggered (Ralph loop done)", "info");
 			}
-			startReview(settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
+			startReview(settings, settings.scope, settings.autoFix, "Ralph loop completion");
 			return;
 		}
 
@@ -195,7 +192,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI) {
 				ctx.ui.notify(`Review triggered (agent finished, ${turnCount} turns)`, "info");
 			}
-			startReview(settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
+			startReview(settings, settings.scope, settings.autoFix, `agent end (${turnCount} turns)`);
 		}
 	});
 

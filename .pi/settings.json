@@ -1,7 +1,10 @@
 {
+  "extensions": [
+    "./extensions"
+  ],
   "autoReview": {
     "todoPath": "TODO.md",
-    "autoFix": false,
+    "autoFix": true,
     "maxFixRounds": 3,
     "onRalphDone": true,
     "onAgentEnd": false,
