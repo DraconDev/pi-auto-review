@@ -63,7 +63,6 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
     "onSessionStart": false,
     "minTurns": 3,
     "cooldownMs": 120000,
-    "prompt": null,
     "scope": "full",
     "excludePatterns": ["node_modules", ".git", "dist", "build", "coverage"]
   }
@@ -85,7 +84,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 | `scope` | `"full"\|"staged"\|"diff"` | `"full"` | Review scope |
 | `excludePatterns` | `string[]` | `["node_modules", ...]` | Directories to skip |
 | `prompt` | `string\|null` | `null` | Custom first-review prompt (replaces default) |
-| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt in fix loop. Supports `{round}`, `{maxRounds}`, `{previousItems}` placeholders |
+| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt in fix loop. Supports `{round}`, `{maxRounds}`, `{previousItems}`, `{focusAreas}` placeholders |
 | `fixInstruction` | `string\|null` | `null` | Custom instruction appended when autoFix is on |
 | `focusAreas` | `string[]\|null` | `null` | Override default list of things to look for |
 
@@ -97,6 +96,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 | `/review staged` | Review only staged changes |
 | `/review diff` | Review diff from main branch |
 | `/review fix` | Review and auto-fix in a loop until clean |
+| `/review stop` | Stop any in-progress fix loop |
 
 ## Fix-Only Philosophy
 
@@ -138,10 +138,35 @@ All prompts are customizable. Use `null` or omit to keep defaults.
 | `{round}` | Current fix loop round (1, 2, 3...) |
 | `{maxRounds}` | `maxFixRounds` setting |
 | `{previousItems}` | Items found in previous round |
+| `{focusAreas}` | Resolved focus areas list (only if custom `focusAreas` is set) |
+
+## Customizing Focus Areas
+
+The default focus areas (when `focusAreas` is not set):
+
+- Lint errors, type errors, build failures
+- Failing or missing tests
+- Security vulnerabilities
+- Broken imports or missing dependencies
+- Dead code, unreachable branches
+- TODO/FIXME/HACK comments that indicate known BUGS (not feature ideas)
+- Inconsistencies between code and config
+- Performance problems that are bugs (N+1 queries, memory leaks)
+
+Override with `focusAreas: [...]` in settings.
 
 ## Cooldown
 
 Auto-reviews have a 2-minute cooldown by default (`cooldownMs: 120000`). This prevents review spam when multiple events fire close together (e.g., Ralph completes → agent_end fires right after).
+
+## `.pi/settings.json` — Git Strategy
+
+The `.pi/settings.json` file contains review configuration. It can be committed to share team settings, or kept local-only. If you want it local-only, add to `.gitignore`:
+
+```
+TODO.md
+.pi/settings.json
+```
 
 ## License
 

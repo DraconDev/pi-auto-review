@@ -70,7 +70,6 @@ const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 		"target",
 	],
 	cooldownMs: 120_000,
-	// Custom prompts (null = use built-in defaults)
 	prompt: null,
 	rereviewPrompt: null,
 	fixInstruction: null,
@@ -97,9 +96,13 @@ interface AutoReviewSettings {
 }
 
 type ReviewScope = "full" | "staged" | "diff";
-type CycleState = "idle" | "reviewing" | "fixing";
+type CycleState = "idle" | "reviewing";
 
-// ── Settings ────────────────────────────────────────────────────────────────
+// ── Settings (cached per session) ─────────────────────────────────────────
+
+let _cachedSettings: Required<AutoReviewSettings> | null = null;
+let _cachedSettingsPath = "";
+let _cachedMtimeKey = "";
 
 function readSettingsJson(filePath: string): Record<string, unknown> | null {
 	try {
@@ -122,17 +125,41 @@ function getSettings(cwd: string): Required<AutoReviewSettings> {
 	const projectSettingsPath = path.join(cwd, ".pi", "settings.json");
 	const globalSettingsPath = path.join(homedir(), ".pi", "agent", "settings.json");
 
+	const mtimeKey = [projectSettingsPath, globalSettingsPath]
+		.filter(fs.existsSync)
+		.map((p) => `${p}:${fs.statSync(p).mtimeMs}`)
+		.join("|");
+
+	if (_cachedSettings && _cachedSettingsPath === cwd && mtimeKey === _cachedMtimeKey) {
+		return _cachedSettings;
+	}
+
 	for (const settingsPath of [projectSettingsPath, globalSettingsPath]) {
 		const data = readSettingsJson(settingsPath);
 		if (data) {
 			const raw = data.autoReview ?? data["auto-review"];
 			if (raw && typeof raw === "object") {
-				return { ...DEFAULT_SETTINGS, ...(raw as AutoReviewSettings) };
+				_cachedSettings = { ...DEFAULT_SETTINGS, ...(raw as AutoReviewSettings) };
+				_cachedSettingsPath = cwd;
+				_cachedMtimeKey = mtimeKey;
+				return _cachedSettings;
 			}
 		}
 	}
-	return { ...DEFAULT_SETTINGS };
+	_cachedSettings = { ...DEFAULT_SETTINGS };
+	_cachedSettingsPath = cwd;
+	_cachedMtimeKey = mtimeKey;
+	return _cachedSettings;
 }
+
+// ── Review methodology (inline, no skill dependency) ───────────────────────
+
+const REVIEW_METHODOLOGY = `Use this FIX-ONLY review methodology:
+1. **Build check** — run the project's build command and type checker (e.g., npm run build && npx tsc --noEmit)
+2. **Test suite** — run the project's test command (e.g., npm test)
+3. **Bug markers** — grep for FIXME, HACK, XXX, console.log, : any, as any in source files
+4. **Security** — grep for hardcoded secrets (password=, api_key=, secret=), eval(), unsafe patterns
+5. **Dependency health** — run npm ls to check for missing/broken deps`;
 
 // ── Prompt Builders ─────────────────────────────────────────────────────────
 
@@ -151,7 +178,6 @@ function buildReviewPrompt(
 	autoFix: boolean,
 	triggerReason: string,
 ): string {
-	// Custom prompt overrides everything
 	if (settings.prompt) {
 		let prompt = `${REVIEW_MARKER} ${settings.prompt}`;
 		if (autoFix) {
@@ -163,7 +189,7 @@ function buildReviewPrompt(
 	const scopeInstruction: Record<ReviewScope, string> = {
 		full: "Review the entire project for problems.",
 		staged: "Review only the staged git changes for problems.",
-		diff: "Review the diff from the main branch for problems.",
+		diff: "Review the diff from the main branch (or trunk/develop if main doesn't exist) for problems.",
 	};
 
 	const excludeNote = settings.excludePatterns.length > 0
@@ -176,7 +202,7 @@ function buildReviewPrompt(
 
 	return `${REVIEW_MARKER} Auto-review triggered by: ${triggerReason}. ${scopeInstruction[scope]}${excludeNote}
 
-Use the /skill:auto-review skill for the review methodology.
+${REVIEW_METHODOLOGY}
 
 This is a FIX-ONLY review. Do NOT propose features or improvements. ONLY find problems that need fixing:
 ${getFocusList(settings)}
@@ -198,12 +224,14 @@ function buildRereviewPrompt(
 	previousItemCount: number,
 	autoFix: boolean,
 ): string {
-	// Custom re-review prompt
 	if (settings.rereviewPrompt) {
 		let prompt = `${REREVIEW_MARKER} ${settings.rereviewPrompt}`
 			.replaceAll("{round}", String(round))
 			.replaceAll("{maxRounds}", String(maxRounds))
 			.replaceAll("{previousItems}", String(previousItemCount));
+		if (prompt.includes("{focusAreas}")) {
+			prompt = prompt.replaceAll("{focusAreas}", getFocusList(settings));
+		}
 		if (autoFix) {
 			prompt += `\n\n${settings.fixInstruction ?? getDefaultFixInstruction(settings.todoPath)}`;
 		}
@@ -218,9 +246,9 @@ function buildRereviewPrompt(
 
 	return `${REREVIEW_MARKER} Re-review after fixes (${roundLabel}). The previous review found ${previousItemCount} items and fixes were applied.
 
-Re-scan the project for remaining problems. This is a FIX-ONLY review just like the first pass.
+Re-scan the project for remaining problems.
 
-Use the /skill:auto-review skill for the review methodology.
+${REVIEW_METHODOLOGY}
 
 ONLY find problems that need fixing:
 ${getFocusList(settings)}
@@ -234,7 +262,7 @@ Write your findings to ${settings.todoPath}. Same format:
 - 🔴 Critical / 🟡 Warning / 🟢 Info
 - At the very end, add: _Items found: N_ where N is total unfixed [ ] items
 
-If you find ZERO problems, write an empty TODO.md with just a header saying "Project is clean ✅".
+If you find ZERO problems, write an empty ${settings.todoPath} with just a header saying "Project is clean ✅".
 
 Do NOT propose features. Only problems that need fixing.${fixAppend}`;
 }
@@ -242,7 +270,7 @@ Do NOT propose features. Only problems that need fixing.${fixAppend}`;
 // ── Detection helpers ───────────────────────────────────────────────────────
 
 function isRalphCompletion(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
-	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i--) {
+	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i++) {
 		const msg = messages[i];
 		if (!msg) continue;
 		if (msg.role === "assistant" && typeof msg.content === "string") {
@@ -254,7 +282,7 @@ function isRalphCompletion(messages: Array<{ role: string; content?: string; too
 }
 
 function isReviewCycleMessage(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
-	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i--) {
+	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i++) {
 		const msg = messages[i];
 		if (!msg) continue;
 		const text = typeof msg.content === "string" ? msg.content : "";
@@ -263,24 +291,25 @@ function isReviewCycleMessage(messages: Array<{ role: string; content?: string; 
 	return false;
 }
 
+/**
+ * Count unfixed [ ] items ONLY within the auto-generated section.
+ * Avoids false positives from code blocks and examples.
+ */
 function countUnfixedItems(todoPath: string, cwd: string): number {
 	const fullPath = path.resolve(cwd, todoPath);
 	try {
 		const content = fs.readFileSync(fullPath, "utf-8");
-		const matches = content.match(/^- \[ \]/gm);
+		const startMatch = content.search(/<!--\s*auto-review-start\s*-->/i);
+		if (startMatch === -1) return 0;
+		const endMatch = content.search(/<!--\s*auto-review-end\s*-->/i);
+		const section = endMatch === -1
+			? content.slice(startMatch)
+			: content.slice(startMatch, endMatch);
+		const stripped = section.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, "");
+		const matches = stripped.match(/^- \[ \]/gm);
 		return matches ? matches.length : 0;
 	} catch {
 		return -1;
-	}
-}
-
-function isProjectClean(todoPath: string, cwd: string): boolean {
-	const fullPath = path.resolve(cwd, todoPath);
-	try {
-		const content = fs.readFileSync(fullPath, "utf-8");
-		return content.includes("Project is clean") || content.includes("Items found: 0");
-	} catch {
-		return false;
 	}
 }
 
@@ -320,6 +349,15 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 	}
 
+	function stopFixLoop(pi: ExtensionAPI, hasUI: boolean) {
+		const wasActive = cycleState !== "idle";
+		if (!wasActive) return;
+		cycleState = "idle";
+		if (hasUI) {
+			pi.sendUserMessage("🔍 Fix loop stopped by user.", { deliverAs: "followUp" });
+		}
+	}
+
 	function handleFixRoundComplete(
 		pi: ExtensionAPI,
 		settings: Required<AutoReviewSettings>,
@@ -328,8 +366,7 @@ export default function (pi: ExtensionAPI) {
 	) {
 		const currentItemCount = countUnfixedItems(settings.todoPath, cwd);
 
-		// Clean project
-		if (currentItemCount === 0 || isProjectClean(settings.todoPath, cwd)) {
+		if (currentItemCount === 0) {
 			cycleState = "idle";
 			if (hasUI) {
 				pi.sendUserMessage("🔍 Auto-review: project is clean ✅", { deliverAs: "followUp" });
@@ -339,7 +376,6 @@ export default function (pi: ExtensionAPI) {
 
 		fixRound++;
 
-		// Hit max rounds
 		if (fixRound >= settings.maxFixRounds) {
 			cycleState = "idle";
 			if (hasUI) {
@@ -351,7 +387,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Diverging
 		if (previousItemCount >= 0 && currentItemCount > previousItemCount) {
 			cycleState = "idle";
 			if (hasUI) {
@@ -363,7 +398,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Converging → re-review
 		previousItemCount = currentItemCount;
 		cycleState = "reviewing";
 
@@ -380,11 +414,15 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Session Start ────────────────────────────────────────────────────
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", (_event, ctx) => {
 		turnCount = 0;
 		cycleState = "idle";
+		cycleAutoFix = false;
 		fixRound = 0;
 		previousItemCount = -1;
+		_cachedSettings = null;
+		_cachedSettingsPath = "";
+		_cachedMtimeKey = "";
 		const settings = getSettings(ctx.cwd);
 
 		if (settings.onSessionStart && shouldTrigger(settings)) {
@@ -397,13 +435,13 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Turn Counting ────────────────────────────────────────────────────
 
-	pi.on("turn_end", async () => {
+	pi.on("turn_end", () => {
 		turnCount++;
 	});
 
 	// ── Agent End ────────────────────────────────────────────────────────
 
-	pi.on("agent_end", async (event, ctx) => {
+	pi.on("agent_end", (event, ctx) => {
 		const settings = getSettings(ctx.cwd);
 		const messages = event.messages as Array<{
 			role: string;
@@ -416,7 +454,6 @@ export default function (pi: ExtensionAPI) {
 			previousItemCount = currentItemCount;
 
 			if (cycleAutoFix) {
-				cycleState = "fixing";
 				handleFixRoundComplete(pi, settings, ctx.cwd, ctx.hasUI);
 			} else {
 				cycleState = "idle";
@@ -427,12 +464,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (cycleState === "fixing") {
-			handleFixRoundComplete(pi, settings, ctx.cwd, ctx.hasUI);
-			return;
-		}
-
-		// Idle — check for real-work triggers
 		if (isReviewCycleMessage(messages)) return;
 
 		if (settings.onRalphDone && isRalphCompletion(messages)) {
@@ -454,19 +485,26 @@ export default function (pi: ExtensionAPI) {
 	// ── /review command ──────────────────────────────────────────────────
 
 	pi.registerCommand("review", {
-		description: "Review project for problems and update TODO.md. Use: /review [staged|diff|fix]",
+		description: "Review project for problems. Use: /review [staged|diff|fix] or /review stop",
 		getArgumentCompletions(prefix: string) {
 			const options = [
 				{ value: "staged", label: "staged", description: "Review only staged changes" },
 				{ value: "diff", label: "diff", description: "Review diff from main branch" },
 				{ value: "fix", label: "fix", description: "Review and auto-fix (loop until clean)" },
+				{ value: "stop", label: "stop", description: "Stop any in-progress fix loop" },
 			];
 			const filtered = options.filter((o) => o.value.startsWith(prefix));
 			return filtered.length > 0 ? filtered : null;
 		},
 		handler: async (args, ctx) => {
-			const settings = getSettings(ctx.cwd);
 			const normalized = (args || "").trim().toLowerCase();
+
+			if (normalized === "stop") {
+				stopFixLoop(pi, ctx.hasUI);
+				return;
+			}
+
+			const settings = getSettings(ctx.cwd);
 
 			let scope: ReviewScope = settings.scope as ReviewScope;
 			let autoFix = settings.autoFix;
@@ -499,7 +537,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── System prompt hints ─────────────────────────────────────────────
 
-	pi.on("before_agent_start", async (event, ctx) => {
+	pi.on("before_agent_start", (event, ctx) => {
 		const text = event.prompt || "";
 		const settings = getSettings(ctx.cwd);
 
@@ -507,7 +545,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				systemPrompt:
 					event.systemPrompt +
-					`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. The auto-review skill contains the methodology — load /skill:auto-review if needed. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include a line: _Items found: N_ with the total count of unfixed [ ] items.`,
+					`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. Methodology: build check (tsc --noEmit), test suite, grep for FIXME/HACK/console.log/: any, security scan (hardcoded secrets, eval), npm ls for dep health. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include a line: _Items found: N_ with the total count of unfixed [ ] items.`,
 			};
 		}
 	});
