@@ -14,7 +14,6 @@
     "build": "echo 'Nothing to build — Pi loads TypeScript directly'",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:ui": "vitest --ui",
     "lint": "eslint extensions/**/*.ts",
     "lint:fix": "eslint extensions/**/*.ts --fix",
     "clean": "rm -rf node_modules coverage"
@@ -28,13 +27,10 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
     "@typescript-eslint/eslint-plugin": "^8.59.4",
     "@typescript-eslint/parser": "^8.59.4",
-    "@vitest/ui": "^4.1.6",
     "eslint": "^10.4.0",
-    "typescript-eslint": "^8.59.4",
     "vitest": "^4.1.6"
   },
   "repository": {
