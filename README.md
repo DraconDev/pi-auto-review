@@ -82,9 +82,12 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 | `onSessionStart` | `boolean` | `false` | Auto-review on session start |
 | `minTurns` | `number` | `3` | Minimum turns before `onAgentEnd` fires |
 | `cooldownMs` | `number` | `120000` | Minimum ms between auto-reviews (prevents spam) |
-| `prompt` | `string\|null` | `null` | Custom review prompt (overrides default) |
 | `scope` | `"full"\|"staged"\|"diff"` | `"full"` | Review scope |
 | `excludePatterns` | `string[]` | `["node_modules", ...]` | Directories to skip |
+| `prompt` | `string\|null` | `null` | Custom first-review prompt (replaces default) |
+| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt in fix loop. Supports `{round}`, `{maxRounds}`, `{previousItems}` placeholders |
+| `fixInstruction` | `string\|null` | `null` | Custom instruction appended when autoFix is on |
+| `focusAreas` | `string[]\|null` | `null` | Override default list of things to look for |
 
 ## Manual Commands
 
@@ -111,15 +114,30 @@ Auto-review finds **what's broken**, not what's missing:
 
 ## Custom Prompts
 
-Override the default review prompt:
+All prompts are customizable. Use `null` or omit to keep defaults.
 
 ```json
 {
   "autoReview": {
-    "prompt": "Focus on TypeScript strict mode errors and security issues in the API routes. Update TODO.md with findings."
+    "prompt": "Focus on TypeScript strict mode errors and security issues in the API routes. Update TODO.md with findings.",
+    "rereviewPrompt": "Check round {round}/{maxRounds}. Previously found {previousItems} issues. Re-scan for remaining problems.",
+    "fixInstruction": "Fix each item, then run the test suite to verify.",
+    "focusAreas": [
+      "Type errors in src/api/",
+      "Security issues (hardcoded secrets, eval usage)",
+      "Failing tests"
+    ]
   }
 }
 ```
+
+### rereviewPrompt placeholders
+
+| Placeholder | Replaced with |
+|-------------|-------------|
+| `{round}` | Current fix loop round (1, 2, 3...) |
+| `{maxRounds}` | `maxFixRounds` setting |
+| `{previousItems}` | Items found in previous round |
 
 ## Cooldown
 
