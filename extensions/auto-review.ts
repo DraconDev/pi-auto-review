@@ -5,26 +5,28 @@
  * writes findings to TODO.md, and optionally auto-fixes them in bounded
  * loops until the project is clean.
  *
- * This extension is purely event-driven — there is no /review command.
+ * Invisible to the agent — no commands, no skills, no markers, no branding.
  * Reviews trigger automatically when configured conditions are met.
+ * The agent just receives a follow-up message and does the work.
  *
  * Settings (in .pi/settings.json or ~/.pi/agent/settings.json):
- *   autoReview.todoPath          - path to todo file (default: "TODO.md")
- *   autoReview.autoFix           - after writing todos, go fix them (default: false)
- *   autoReview.maxFixRounds      - max review→fix→re-review loops (default: 3)
- *   autoReview.onRalphDone       - auto-review when Ralph loop completes (default: true)
- *   autoReview.onAgentEnd        - auto-review after any agent_end (default: false)
- *   autoReview.onSessionStart    - auto-review on session start (default: false)
- *   autoReview.minTurns          - minimum turns before agent_end triggers review (default: 3)
- *   autoReview.scope             - "full" | "staged" | "diff" (default: "full")
- *   autoReview.excludePatterns   - dirs to exclude (default: ["node_modules", ...])
- *   autoReview.cooldownMs        - minimum ms between auto-reviews (default: 120000)
+ *   autoReview.enabled          - master toggle (default: true)
+ *   autoReview.todoPath         - path to todo file (default: "TODO.md")
+ *   autoReview.autoFix          - after writing todos, go fix them (default: false)
+ *   autoReview.maxFixRounds     - max review→fix→re-review loops (default: 3)
+ *   autoReview.onRalphDone      - auto-review when Ralph loop completes (default: true)
+ *   autoReview.onAgentEnd       - auto-review after any agent_end (default: false)
+ *   autoReview.onSessionStart   - auto-review on session start (default: false)
+ *   autoReview.minTurns         - minimum turns before agent_end triggers review (default: 3)
+ *   autoReview.scope            - "full" | "staged" | "diff" (default: "full")
+ *   autoReview.excludePatterns  - dirs to exclude (default: ["node_modules", ...])
+ *   autoReview.cooldownMs       - minimum ms between auto-reviews (default: 120000)
  *
  *   Custom prompts (all optional, override defaults):
- *   autoReview.prompt             - custom first-review prompt
- *   autoReview.rereviewPrompt     - custom re-review prompt (in fix loop)
- *   autoReview.fixInstruction     - custom instruction appended when autoFix is on
- *   autoReview.focusAreas         - override the default list of things to look for
+ *   autoReview.prompt            - custom first-review prompt
+ *   autoReview.rereviewPrompt    - custom re-review prompt (in fix loop)
+ *   autoReview.fixInstruction    - custom instruction appended when autoFix is on
+ *   autoReview.focusAreas        - override the default list of things to look for
  */
 
 import * as fs from "node:fs";
@@ -32,10 +34,10 @@ import * as path from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// ── Constants ───────────────────────────────────────────────────────────────
+// ── Internal sentinels (never shown to agent) ──────────────────────────────
 
-const REVIEW_MARKER = "[pi-auto-review]";
-const REREVIEW_MARKER = "[pi-auto-review-rereview]";
+const _REVIEW_SENTINEL = "\x00AR1\x00";
+const _REREVIEW_SENTINEL = "\x00AR2\x00";
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 
@@ -51,6 +53,7 @@ const DEFAULT_FOCUS_AREAS = [
 ];
 
 const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
+	enabled: true,
 	todoPath: "TODO.md",
 	autoFix: false,
 	maxFixRounds: 3,
@@ -82,6 +85,7 @@ const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 // ── Types ───────────────────────────────────────────────────────────────────
 
 interface AutoReviewSettings {
+	enabled?: boolean;
 	todoPath?: string;
 	autoFix?: boolean;
 	maxFixRounds?: number;
@@ -101,11 +105,19 @@ interface AutoReviewSettings {
 type ReviewScope = "full" | "staged" | "diff";
 type CycleState = "idle" | "reviewing";
 
-// ── Settings (cached per session) ─────────────────────────────────────────
+// ── Settings (cached per session, safe mtime) ──────────────────────────────
 
 let _cachedSettings: Required<AutoReviewSettings> | null = null;
 let _cachedSettingsPath = "";
 let _cachedMtimeKey = "";
+
+function safeStatMtime(filePath: string): string {
+	try {
+		return `${fs.statSync(filePath).mtimeMs}`;
+	} catch {
+		return "none";
+	}
+}
 
 function readSettingsJson(filePath: string): Record<string, unknown> | null {
 	try {
@@ -116,10 +128,8 @@ function readSettingsJson(filePath: string): Record<string, unknown> | null {
 		}
 		return null;
 	} catch (err) {
-		if (fs.existsSync(filePath)) {
-			const detail = err instanceof Error ? err.message : String(err);
-			console.warn(`[auto-review] Warning: ${filePath} can't be read — ${detail}`);
-		}
+		const detail = err instanceof Error ? err.message : String(err);
+		console.warn(`[auto-review] Warning: ${filePath} can't be read — ${detail}`);
 		return null;
 	}
 }
@@ -129,8 +139,7 @@ function getSettings(cwd: string): Required<AutoReviewSettings> {
 	const globalSettingsPath = path.join(homedir(), ".pi", "agent", "settings.json");
 
 	const mtimeKey = [projectSettingsPath, globalSettingsPath]
-		.filter(fs.existsSync)
-		.map((p) => `${p}:${fs.statSync(p).mtimeMs}`)
+		.map((p) => `${p}:${safeStatMtime(p)}`)
 		.join("|");
 
 	if (_cachedSettings && _cachedSettingsPath === cwd && mtimeKey === _cachedMtimeKey) {
@@ -155,14 +164,25 @@ function getSettings(cwd: string): Required<AutoReviewSettings> {
 	return _cachedSettings;
 }
 
-// ── Review methodology (inline) ───────────────────────────────────────────
+// ── Review methodology (inline, language-agnostic) ─────────────────────────
 
 const REVIEW_METHODOLOGY = `Use this FIX-ONLY review methodology:
-1. **Build check** — run the project's build command and type checker (e.g., npm run build && npx tsc --noEmit)
-2. **Test suite** — run the project's test command (e.g., npm test)
-3. **Bug markers** — grep for FIXME, HACK, XXX, console.log, : any, as any in source files
+1. **Build check** — run the project's build command and type checker (e.g., npm run build / cargo check / go build)
+2. **Test suite** — run the project's test command (e.g., npm test / cargo test / go test)
+3. **Bug markers** — grep for FIXME, HACK, XXX, console.log, print(), explicit any types (: any, as any) in source files
 4. **Security** — grep for hardcoded secrets (password=, api_key=, secret=), eval(), unsafe patterns
-5. **Dependency health** — run npm ls to check for missing/broken deps`;
+5. **Dependency health** — check for missing or broken dependencies (npm ls / cargo check / go mod verify)`;
+
+const FORMAT_INSTRUCTION = (todoPath: string) => `
+Write your findings to ${todoPath}. Organize by priority:
+- 🔴 Critical — broken build, security issues, data loss risk
+- 🟡 Warning — failing tests, dead code, deprecation issues
+- 🟢 Info — minor fixes, cleanup of accidental issues
+
+Wrap the auto-generated section with <!-- auto-review-start --> and <!-- auto-review-end --> HTML comments.
+At the very end of ${todoPath}, add a line: _Items found: N_ where N is the total count of unfixed [ ] items.
+Keep each item actionable and specific. Include file paths and line numbers where possible.
+Do NOT add feature requests, architecture proposals, or "nice to have" items.`;
 
 // ── Prompt Builders ─────────────────────────────────────────────────────────
 
@@ -181,8 +201,10 @@ function buildReviewPrompt(
 	autoFix: boolean,
 	triggerReason: string,
 ): string {
+	// Custom prompt: prepend sentinel, always append format instruction
 	if (settings.prompt) {
-		let prompt = `${REVIEW_MARKER} ${settings.prompt}`;
+		let prompt = `${_REVIEW_SENTINEL}${settings.prompt}`;
+		prompt += FORMAT_INSTRUCTION(settings.todoPath);
 		if (autoFix) {
 			prompt += `\n\n${settings.fixInstruction ?? getDefaultFixInstruction(settings.todoPath)}`;
 		}
@@ -203,21 +225,13 @@ function buildReviewPrompt(
 		? `\n\n${settings.fixInstruction ?? getDefaultFixInstruction(settings.todoPath)}`
 		: "";
 
-	return `${REVIEW_MARKER} Auto-review triggered by: ${triggerReason}. ${scopeInstruction[scope]}${excludeNote}
+	return `${_REVIEW_SENTINEL}${scopeInstruction[scope]}${excludeNote}
 
 ${REVIEW_METHODOLOGY}
 
 This is a FIX-ONLY review. Do NOT propose features or improvements. ONLY find problems that need fixing:
 ${getFocusList(settings)}
-
-Write your findings to ${settings.todoPath}. Organize by priority:
-- 🔴 Critical — broken build, security issues, data loss risk
-- 🟡 Warning — failing tests, dead code, deprecation issues
-- 🟢 Info — minor fixes, cleanup of accidental issues
-
-At the very end of ${settings.todoPath}, add a line: _Items found: N_ where N is the total count of unfixed [ ] items.
-Keep each item actionable and specific. Include file paths and line numbers where possible.
-Do NOT add feature requests, architecture proposals, or "nice to have" items.${fixInstruction}`;
+${FORMAT_INSTRUCTION(settings.todoPath)}${fixInstruction}`;
 }
 
 function buildRereviewPrompt(
@@ -227,27 +241,28 @@ function buildRereviewPrompt(
 	previousItemCount: number,
 	autoFix: boolean,
 ): string {
+	const roundLabel = `round ${round}/${maxRounds}`;
+
 	if (settings.rereviewPrompt) {
-		let prompt = `${REREVIEW_MARKER} ${settings.rereviewPrompt}`
+		let prompt = `${_REREVIEW_SENTINEL}${settings.rereviewPrompt}`
 			.replaceAll("{round}", String(round))
 			.replaceAll("{maxRounds}", String(maxRounds))
 			.replaceAll("{previousItems}", String(previousItemCount));
 		if (prompt.includes("{focusAreas}")) {
 			prompt = prompt.replaceAll("{focusAreas}", getFocusList(settings));
 		}
+		prompt += FORMAT_INSTRUCTION(settings.todoPath);
 		if (autoFix) {
 			prompt += `\n\n${settings.fixInstruction ?? getDefaultFixInstruction(settings.todoPath)}`;
 		}
 		return prompt;
 	}
 
-	const roundLabel = `round ${round}/${maxRounds}`;
-
 	const fixAppend = autoFix
 		? `\n\n${settings.fixInstruction ?? getDefaultFixInstruction(settings.todoPath)}`
 		: "";
 
-	return `${REREVIEW_MARKER} Re-review after fixes (${roundLabel}). The previous review found ${previousItemCount} items and fixes were applied.
+	return `${_REREVIEW_SENTINEL}Re-review after fixes (${roundLabel}). The previous review found ${previousItemCount} items and fixes were applied.
 
 Re-scan the project for remaining problems.
 
@@ -260,10 +275,7 @@ IMPORTANT:
 - Check if the fixes from the previous round actually resolved the claimed issues
 - Look for NEW problems that the fixes may have introduced
 - If a previous fix didn't work, mark it clearly in ${settings.todoPath}
-
-Write your findings to ${settings.todoPath}. Same format:
-- 🔴 Critical / 🟡 Warning / 🟢 Info
-- At the very end, add: _Items found: N_ where N is total unfixed [ ] items
+${FORMAT_INSTRUCTION(settings.todoPath)}
 
 If you find ZERO problems, write an empty ${settings.todoPath} with just a header saying "Project is clean ✅".
 
@@ -279,24 +291,13 @@ function isRalphCompletion(messages: Array<{ role: string; content?: string; too
 		if (msg.role === "assistant" && typeof msg.content === "string") {
 			if (msg.content.includes("<promise>COMPLETE</promise>")) return true;
 		}
-		if (msg.toolName === "ralph_done") return true;
-	}
-	return false;
-}
-
-function isReviewCycleMessage(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
-	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 10); i--) {
-		const msg = messages[i];
-		if (!msg) continue;
-		const text = typeof msg.content === "string" ? msg.content : "";
-		if (text.includes(REVIEW_MARKER) || text.includes(REREVIEW_MARKER)) return true;
 	}
 	return false;
 }
 
 /**
  * Count unfixed [ ] items ONLY within the auto-generated section.
- * Avoids false positives from code blocks and examples.
+ * Returns 0 for missing files (not an error — just means no items yet).
  */
 function countUnfixedItems(todoPath: string, cwd: string): number {
 	const fullPath = path.resolve(cwd, todoPath);
@@ -312,7 +313,7 @@ function countUnfixedItems(todoPath: string, cwd: string): number {
 		const matches = stripped.match(/^- \[ \]/gm);
 		return matches ? matches.length : 0;
 	} catch {
-		return -1;
+		return 0;
 	}
 }
 
@@ -327,6 +328,7 @@ export default function (pi: ExtensionAPI) {
 	let previousItemCount = -1;
 
 	function shouldTrigger(settings: Required<AutoReviewSettings>): boolean {
+		if (!settings.enabled) return false;
 		if (cycleState !== "idle") return false;
 		const now = Date.now();
 		if (now - lastAutoReviewTime < settings.cooldownMs) return false;
@@ -348,7 +350,12 @@ export default function (pi: ExtensionAPI) {
 		lastAutoReviewTime = Date.now();
 
 		const prompt = buildReviewPrompt(settings, scope, autoFix, reason);
-		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		try {
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		} catch (err) {
+			console.warn(`[auto-review] sendUserMessage failed: ${err instanceof Error ? err.message : err}`);
+			cycleState = "idle";
+		}
 	}
 
 	function handleFixRoundComplete(
@@ -360,9 +367,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (currentItemCount === 0) {
 			cycleState = "idle";
-			if (hasUI) {
-				pi.sendUserMessage("🔍 Auto-review: project is clean ✅", { deliverAs: "followUp" });
-			}
+			console.log("[auto-review] project is clean");
 			return;
 		}
 
@@ -370,23 +375,13 @@ export default function (pi: ExtensionAPI) {
 
 		if (fixRound >= settings.maxFixRounds) {
 			cycleState = "idle";
-			if (hasUI) {
-				pi.sendUserMessage(
-					`🔍 Auto-review: reached max fix rounds (${settings.maxFixRounds}). ${currentItemCount} items remain in ${settings.todoPath}.`,
-					{ deliverAs: "followUp" },
-				);
-			}
+			console.log(`[auto-review] max fix rounds reached (${settings.maxFixRounds}), ${currentItemCount} items remain`);
 			return;
 		}
 
 		if (previousItemCount >= 0 && currentItemCount > previousItemCount) {
 			cycleState = "idle";
-			if (hasUI) {
-				pi.sendUserMessage(
-					`🔍 Auto-review: diverging (${currentItemCount} items now vs ${previousItemCount} before). Stopping fix loop. ${currentItemCount} items remain in ${settings.todoPath}.`,
-					{ deliverAs: "followUp" },
-				);
-			}
+			console.log(`[auto-review] diverging (${currentItemCount} items now vs ${previousItemCount} before), stopping`);
 			return;
 		}
 
@@ -394,14 +389,14 @@ export default function (pi: ExtensionAPI) {
 		cycleState = "reviewing";
 
 		const rereviewPrompt = buildRereviewPrompt(settings, fixRound, settings.maxFixRounds, currentItemCount, cycleAutoFix);
-		pi.sendUserMessage(rereviewPrompt, { deliverAs: "followUp" });
-
-		if (hasUI) {
-			pi.sendUserMessage(
-				`🔍 Fix loop round ${fixRound}/${settings.maxFixRounds} — ${currentItemCount} items remaining, re-reviewing`,
-				{ deliverAs: "followUp" },
-			);
+		try {
+			pi.sendUserMessage(rereviewPrompt, { deliverAs: "followUp" });
+		} catch (err) {
+			console.warn(`[auto-review] sendUserMessage failed: ${err instanceof Error ? err.message : err}`);
+			cycleState = "idle";
 		}
+
+		console.log(`[auto-review] fix loop round ${fixRound}/${settings.maxFixRounds} — ${currentItemCount} items remaining`);
 	}
 
 	// ── Session Start ────────────────────────────────────────────────────
@@ -419,7 +414,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (settings.onSessionStart && shouldTrigger(settings)) {
 			if (ctx.hasUI) {
-				ctx.ui.notify("🔍 Auto-review triggered (session start)", "info");
+				ctx.ui.notify("Review triggered (session start)", "info");
 			}
 			startReview(settings, settings.scope as ReviewScope, settings.autoFix, "session start");
 		}
@@ -441,6 +436,7 @@ export default function (pi: ExtensionAPI) {
 			toolName?: string;
 		}>;
 
+		// If we're in a review cycle, handle completion
 		if (cycleState === "reviewing") {
 			const currentItemCount = countUnfixedItems(settings.todoPath, ctx.cwd);
 			previousItemCount = currentItemCount;
@@ -449,18 +445,22 @@ export default function (pi: ExtensionAPI) {
 				handleFixRoundComplete(settings, ctx.cwd, ctx.hasUI);
 			} else {
 				cycleState = "idle";
-				if (ctx.hasUI) {
-					ctx.ui.notify("✅ Review complete", "info");
-				}
+				console.log("[auto-review] review complete");
 			}
 			return;
 		}
 
-		if (isReviewCycleMessage(messages)) return;
+		// Skip if any recent message is from our review cycle
+		const isOurCycle = messages.slice(-10).some((m) => {
+			const text = typeof m.content === "string" ? m.content : "";
+			return text.includes(_REVIEW_SENTINEL) || text.includes(_REREVIEW_SENTINEL);
+		});
+		if (isOurCycle) return;
 
+		// Real work triggers
 		if (settings.onRalphDone && isRalphCompletion(messages)) {
 			if (ctx.hasUI) {
-				ctx.ui.notify("🔍 Ralph loop done — triggering auto-review", "info");
+				ctx.ui.notify("Review triggered (Ralph loop done)", "info");
 			}
 			startReview(settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
 			return;
@@ -468,24 +468,23 @@ export default function (pi: ExtensionAPI) {
 
 		if (settings.onAgentEnd && turnCount >= settings.minTurns) {
 			if (ctx.hasUI) {
-				ctx.ui.notify(`🔍 Agent finished (${turnCount} turns) — triggering auto-review`, "info");
+				ctx.ui.notify(`Review triggered (agent finished, ${turnCount} turns)`, "info");
 			}
 			startReview(settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
 		}
 	});
 
-	// ── System prompt hints ─────────────────────────────────────────────
+	// ── System prompt hints (sentinel-detected, no branding) ────────────
 
 	pi.on("before_agent_start", (event, ctx) => {
 		const text = event.prompt || "";
-		const settings = getSettings(ctx.cwd);
+		if (!text.includes(_REVIEW_SENTINEL) && !text.includes(_REREVIEW_SENTINEL)) return;
 
-		if (text.includes(REVIEW_MARKER) || text.includes(REREVIEW_MARKER)) {
-			return {
-				systemPrompt:
-					event.systemPrompt +
-					`\n\nThis is a fix-only review — do NOT propose features or improvements. Methodology: build check (tsc --noEmit), test suite, grep for FIXME/HACK/console.log/: any, security scan (hardcoded secrets, eval), npm ls for dep health. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include a line: _Items found: N_ with the total count of unfixed [ ] items.`,
-			};
-		}
+		const settings = getSettings(ctx.cwd);
+		return {
+			systemPrompt:
+				event.systemPrompt +
+				`\n\nThis is a fix-only review — do NOT propose features or improvements. Methodology: build check, test suite, grep for FIXME/HACK/console.log/explicit any types, security scan (hardcoded secrets, eval), check dependency health. Write findings to: ${settings.todoPath}. Use <!-- auto-review-start --> and <!-- auto-review-end --> markers. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info. At the end of ${settings.todoPath}, include: _Items found: N_ with the total count of unfixed [ ] items.`,
+		};
 	});
 }

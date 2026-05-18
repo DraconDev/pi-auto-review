@@ -4,7 +4,7 @@ Event-driven project review for [Pi](https://pi.dev) — automatically scans for
 
 ## The Point
 
-This extension is **invisible to the agent**. There is no `/review` command, no skill, no way for the agent to invoke it. Reviews trigger automatically when configured conditions are met — the agent just receives a follow-up message and does the work without knowing where it came from.
+This extension is **invisible to the agent**. No commands, no skills, no markers, no branding. Reviews trigger automatically when configured conditions are met — the agent just receives a follow-up message and does the work.
 
 ## Install
 
@@ -15,7 +15,7 @@ pi install /path/to/pi-auto-review
 ## How It Works
 
 ```
-Ralph loop done → 🔍 review → 📝 TODO.md → 🔧 fix → 🔍 re-review → 🔧 fix → 🔍 re-review (clean) → ✅
+Ralph loop done → review → TODO.md → fix → re-review → fix → re-review (clean) → ✅
 ```
 
 1. **Work completes** (Ralph loop done, agent finishes, session starts)
@@ -25,11 +25,6 @@ Ralph loop done → 🔍 review → 📝 TODO.md → 🔧 fix → 🔍 re-review
 5. **Convergence check** — if fixes cause MORE problems, bail immediately
 
 ### The fix loop is bounded
-
-```
-round 1: 8 items found → fix → round 2: 3 items → fix → round 3: 0 items → ✅ clean
-round 1: 5 items → fix → round 2: 7 items → ⚠️ diverging, bail
-```
 
 - **maxFixRounds** (default 3) — hard cap
 - **Divergence detection** — if a re-review finds MORE items than before, stops immediately
@@ -43,8 +38,6 @@ round 1: 5 items → fix → round 2: 7 items → ⚠️ diverging, bail
 | `onAgentEnd` | `false` | Auto-review after any agent finishes (after `minTurns`) |
 | `onSessionStart` | `false` | Auto-review when a session starts |
 
-The primary use case: **`onRalphDone: true`** (the default). After a Ralph loop finishes pushing features, auto-review catches what got broken and writes fix items to `TODO.md`.
-
 ## Configuration
 
 Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
@@ -52,6 +45,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 ```json
 {
   "autoReview": {
+    "enabled": true,
     "todoPath": "TODO.md",
     "autoFix": false,
     "maxFixRounds": 3,
@@ -70,6 +64,7 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Master toggle — disable without uninstalling |
 | `todoPath` | `string` | `"TODO.md"` | Path to the todo file |
 | `autoFix` | `boolean` | `false` | After building the todo, go fix the problems |
 | `maxFixRounds` | `number` | `3` | Max review→fix→re-review loops |
@@ -77,11 +72,11 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 | `onAgentEnd` | `boolean` | `false` | Auto-review after agent finishes |
 | `onSessionStart` | `boolean` | `false` | Auto-review on session start |
 | `minTurns` | `number` | `3` | Minimum turns before `onAgentEnd` fires |
-| `cooldownMs` | `number` | `120000` | Minimum ms between auto-reviews (prevents spam) |
+| `cooldownMs` | `number` | `120000` | Minimum ms between auto-reviews |
 | `scope` | `"full"\|"staged"\|"diff"` | `"full"` | Review scope |
 | `excludePatterns` | `string[]` | `["node_modules", ...]` | Directories to skip |
-| `prompt` | `string\|null` | `null` | Custom first-review prompt (replaces default) |
-| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt. Supports `{round}`, `{maxRounds}`, `{previousItems}`, `{focusAreas}` placeholders |
+| `prompt` | `string\|null` | `null` | Custom first-review prompt |
+| `rereviewPrompt` | `string\|null` | `null` | Custom re-review prompt. Placeholders: `{round}`, `{maxRounds}`, `{previousItems}`, `{focusAreas}` |
 | `fixInstruction` | `string\|null` | `null` | Custom instruction appended when autoFix is on |
 | `focusAreas` | `string[]\|null` | `null` | Override default list of things to look for |
 
@@ -97,7 +92,6 @@ Auto-review finds **what's broken**, not what's missing:
 - ❌ Feature requests ("add dark mode")
 - ❌ Architecture proposals ("should use microservices")
 - ❌ Nice-to-haves ("consider using X pattern")
-- ❌ TODOs that are feature ideas, not bugs
 
 ## Custom Prompts
 
@@ -106,8 +100,8 @@ All prompts are customizable. Use `null` or omit to keep defaults.
 ```json
 {
   "autoReview": {
-    "prompt": "Focus on TypeScript strict mode errors and security issues in the API routes. Update TODO.md with findings.",
-    "rereviewPrompt": "Check round {round}/{maxRounds}. Previously found {previousItems} issues. Re-scan for remaining problems.",
+    "prompt": "Focus on TypeScript strict mode errors and security issues in the API routes.",
+    "rereviewPrompt": "Check round {round}/{maxRounds}. Previously found {previousItems} issues.",
     "fixInstruction": "Fix each item, then run the test suite to verify.",
     "focusAreas": [
       "Type errors in src/api/",
@@ -118,18 +112,11 @@ All prompts are customizable. Use `null` or omit to keep defaults.
 }
 ```
 
+Note: format instructions (TODO.md markers, `_Items found: N_`) are always appended, even with custom prompts. This ensures the fix loop's item counting works correctly.
+
 ## Cooldown
 
-Auto-reviews have a 2-minute cooldown by default (`cooldownMs: 120000`). This prevents review spam when multiple events fire close together.
-
-## `.pi/settings.json` — Git Strategy
-
-The `.pi/settings.json` file can be committed to share team settings, or kept local-only. If local-only, add to `.gitignore`:
-
-```
-TODO.md
-.pi/settings.json
-```
+2-minute cooldown by default (`cooldownMs: 120000`). Prevents review spam when multiple events fire close together.
 
 ## License
 
