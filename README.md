@@ -1,22 +1,36 @@
 # pi-auto-review
 
-Automated project review for [Pi](https://pi.dev) — scans your codebase for problems, writes findings to `TODO.md`, and optionally auto-executes fixes.
+Event-driven project review for [Pi](https://pi.dev) — automatically scans for problems after work completes, writes findings to `TODO.md`, and optionally auto-fixes them.
 
-## What It Does
+## The Point
 
-1. **Scans** your project for issues: lint errors, type errors, failing tests, dead code, security problems, broken imports, TODO/FIXME comments, and more
-2. **Writes** a prioritized `TODO.md` with clear, actionable items
-3. **Optionally auto-fixes** — after building the todo list, tells the agent to go fix the problems
-
-This is **not** for feature development. It's for finding and fixing what's broken.
+This isn't `/review` that you remember to run. It **fires automatically** when work finishes — after a Ralph loop completes, after the agent finishes a long session, or on session start. It finds what's broken and writes it to `TODO.md`. Strictly fixes, not features.
 
 ## Install
 
 ```bash
-pi install npm:pi-auto-review
-# or from source
 pi install /path/to/pi-auto-review
+# or publish to npm first:
+pi install npm:pi-auto-review
 ```
+
+## How It Works
+
+1. **Work completes** (Ralph loop done, agent finishes, session starts)
+2. **Review triggers automatically** — scans the project for problems
+3. **TODO.md gets updated** with prioritized fix items
+4. **Optionally auto-fixes** — if configured, the agent then fixes the problems
+
+## Triggers
+
+| Trigger | Default | Description |
+|---------|---------|-------------|
+| `onRalphDone` | `true` | Auto-review when a Ralph loop completes |
+| `onAgentEnd` | `false` | Auto-review after any agent finishes (after `minTurns`) |
+| `onSessionStart` | `false` | Auto-review when a session starts |
+| `/review` | always | Manual trigger anytime |
+
+The primary use case: **`onRalphDone: true`** (the default). After a Ralph loop finishes pushing features, auto-review catches what got broken and writes fix items to `TODO.md`.
 
 ## Configuration
 
@@ -26,9 +40,12 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 {
   "autoReview": {
     "todoPath": "TODO.md",
-    "autoRun": false,
+    "autoFix": false,
+    "onRalphDone": true,
+    "onAgentEnd": false,
     "onSessionStart": false,
-    "onDirty": false,
+    "minTurns": 3,
+    "cooldownMs": 120000,
     "prompt": null,
     "scope": "full",
     "excludePatterns": ["node_modules", ".git", "dist", "build", "coverage"]
@@ -40,34 +57,43 @@ Add to `.pi/settings.json` (project) or `~/.pi/agent/settings.json` (global):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `todoPath` | `string` | `"TODO.md"` | Path to the todo file (relative to project root) |
-| `autoRun` | `boolean` | `false` | After building the todo, tell the agent to go fix the problems |
-| `onSessionStart` | `boolean` | `false` | Automatically run review when a session starts |
-| `onDirty` | `boolean` | `false` | Automatically run review when uncommitted changes are detected |
-| `prompt` | `string\|null` | `null` | Custom review prompt (overrides the default) |
-| `scope` | `"full"\|"staged"\|"diff"` | `"full"` | Review scope — full project, staged changes only, or diff from main |
-| `excludePatterns` | `string[]` | `["node_modules", ...]` | Directories to exclude from review |
+| `todoPath` | `string` | `"TODO.md"` | Path to the todo file |
+| `autoFix` | `boolean` | `false` | After building the todo, go fix the problems |
+| `onRalphDone` | `boolean` | `true` | Auto-review when Ralph loop completes |
+| `onAgentEnd` | `boolean` | `false` | Auto-review after agent finishes |
+| `onSessionStart` | `boolean` | `false` | Auto-review on session start |
+| `minTurns` | `number` | `3` | Minimum turns before `onAgentEnd` fires |
+| `cooldownMs` | `number` | `120000` | Minimum ms between auto-reviews (prevents spam) |
+| `prompt` | `string\|null` | `null` | Custom review prompt (overrides default) |
+| `scope` | `"full"\|"staged"\|"diff"` | `"full"` | Review scope |
+| `excludePatterns` | `string[]` | `["node_modules", ...]` | Directories to skip |
 
-## Commands
+## Manual Commands
 
 | Command | Description |
 |---------|-------------|
-| `/review` | Run a manual review now |
+| `/review` | Full project review → writes TODO.md |
 | `/review staged` | Review only staged changes |
 | `/review diff` | Review diff from main branch |
-| `/review fix` | Review and then auto-fix |
+| `/review fix` | Review and then auto-fix the problems |
 
-## How It Works
+## Fix-Only Philosophy
 
-1. The extension checks configured trigger conditions
-2. When triggered, it builds a review prompt and sends it as a user message
-3. The agent loads the `auto-review` skill, which provides a detailed methodology
-4. The agent scans the project, identifies problems, and writes/updates `TODO.md`
-5. If `autoRun` is enabled, the agent then works through the todo items
+Auto-review finds **what's broken**, not what's missing:
+- ✅ Build errors, type errors, lint failures
+- ✅ Failing tests, missing tests
+- ✅ Security vulnerabilities, hardcoded secrets
+- ✅ Broken imports, dead code
+- ✅ FIXME/HACK markers (bugs, not ideas)
+- ✅ Debug leftovers (console.log in prod)
+- ❌ Feature requests ("add dark mode")
+- ❌ Architecture proposals ("should use microservices")
+- ❌ Nice-to-haves ("consider using X pattern")
+- ❌ TODOs that are feature ideas, not bugs
 
 ## Custom Prompts
 
-Set `autoReview.prompt` to override the default review message:
+Override the default review prompt:
 
 ```json
 {
@@ -76,6 +102,10 @@ Set `autoReview.prompt` to override the default review message:
   }
 }
 ```
+
+## Cooldown
+
+Auto-reviews have a 2-minute cooldown by default (`cooldownMs: 120000`). This prevents review spam when multiple events fire close together (e.g., Ralph completes → agent_end fires right after).
 
 ## License
 

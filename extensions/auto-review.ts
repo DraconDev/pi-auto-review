@@ -1,21 +1,28 @@
 /**
  * Auto Review Extension for Pi
  *
- * Scans the project for problems, writes findings to TODO.md,
- * and optionally tells the agent to go fix them.
+ * Event-driven project review: scans for problems after work completes,
+ * writes findings to TODO.md, and optionally auto-fixes them.
  *
- * Triggers:
- *   - Manual: /review, /review staged, /review diff, /review fix
- *   - Automatic: onSessionStart, onDirty (configurable)
+ * PRIMARY TRIGGERS (automatic):
+ *   - Ralph loop completion  (detects COMPLETE marker in agent_end)
+ *   - agent_end              (after any significant agent work, configurable)
+ *   - session_start          (optional, for fresh session reviews)
+ *
+ * MANUAL OVERRIDE:
+ *   /review [staged|diff|fix]
  *
  * Settings (in .pi/settings.json or ~/.pi/agent/settings.json):
- *   autoReview.todoPath        - path to todo file (default: "TODO.md")
- *   autoReview.autoRun         - after building todo, go fix (default: false)
- *   autoReview.onSessionStart  - auto-review on session start (default: false)
- *   autoReview.onDirty         - auto-review when dirty repo detected (default: false)
- *   autoReview.prompt          - custom review prompt (default: null)
- *   autoReview.scope           - "full" | "staged" | "diff" (default: "full")
- *   autoReview.excludePatterns - dirs to exclude (default: ["node_modules", ...])
+ *   autoReview.todoPath          - path to todo file (default: "TODO.md")
+ *   autoReview.autoFix           - after writing todos, go fix them (default: false)
+ *   autoReview.onRalphDone       - auto-review when Ralph loop completes (default: true)
+ *   autoReview.onAgentEnd        - auto-review after any agent_end (default: false)
+ *   autoReview.onSessionStart    - auto-review on session start (default: false)
+ *   autoReview.minTurns          - minimum turns before agent_end triggers review (default: 3)
+ *   autoReview.prompt            - custom review prompt (default: null)
+ *   autoReview.scope             - "full" | "staged" | "diff" (default: "full")
+ *   autoReview.excludePatterns   - dirs to exclude (default: ["node_modules", ...])
+ *   autoReview.cooldownMs       - minimum ms between auto-reviews (default: 120000 = 2 min)
  */
 
 import * as fs from "node:fs";
@@ -32,9 +39,11 @@ const REVIEW_MARKER = "[pi-auto-review]";
 
 const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 	todoPath: "TODO.md",
-	autoRun: false,
+	autoFix: false,
+	onRalphDone: true,
+	onAgentEnd: false,
 	onSessionStart: false,
-	onDirty: false,
+	minTurns: 3,
 	prompt: null,
 	scope: "full",
 	excludePatterns: [
@@ -50,30 +59,32 @@ const DEFAULT_SETTINGS: Required<AutoReviewSettings> = {
 		".venv",
 		"target",
 	],
+	cooldownMs: 120_000, // 2 minutes between auto-reviews
 };
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
 interface AutoReviewSettings {
 	todoPath?: string;
-	autoRun?: boolean;
+	autoFix?: boolean;
+	onRalphDone?: boolean;
+	onAgentEnd?: boolean;
 	onSessionStart?: boolean;
-	onDirty?: boolean;
+	minTurns?: number;
 	prompt?: string | null;
 	scope?: "full" | "staged" | "diff";
 	excludePatterns?: string[];
+	cooldownMs?: number;
 }
 
-/** Scope of files to review */
 type ReviewScope = "full" | "staged" | "diff";
 
-/** Parsed result from /review command arguments */
 interface ParsedReviewArgs {
 	scope: ReviewScope;
-	autoRun: boolean;
+	autoFix: boolean;
 }
 
-// ── Settings Reader ─────────────────────────────────────────────────────────
+// ── Settings ────────────────────────────────────────────────────────────────
 
 function readSettingsJson(filePath: string): Record<string, unknown> | null {
 	try {
@@ -84,16 +95,14 @@ function readSettingsJson(filePath: string): Record<string, unknown> | null {
 		}
 		return null;
 	} catch (err) {
-		// Only log if the file exists but can't be parsed (not missing — that's expected)
-		if (fs.existsSync(filePath) && (err instanceof SyntaxError)) {
-			console.warn(`[auto-review] Warning: ${filePath} exists but has invalid JSON — using defaults`);
+		if (fs.existsSync(filePath) && err instanceof SyntaxError) {
+			console.warn(`[auto-review] Warning: ${filePath} has invalid JSON — using defaults`);
 		}
 		return null;
 	}
 }
 
 function getSettings(cwd: string): Required<AutoReviewSettings> {
-	// Try project-level settings first, then global
 	const projectSettingsPath = path.join(cwd, ".pi", "settings.json");
 	const globalSettingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
 
@@ -106,31 +115,25 @@ function getSettings(cwd: string): Required<AutoReviewSettings> {
 			}
 		}
 	}
-
 	return { ...DEFAULT_SETTINGS };
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+// ── Prompt Builder ──────────────────────────────────────────────────────────
 
-function parseReviewArgs(args: string, baseScope: string): ParsedReviewArgs {
-	const normalized = args.trim().toLowerCase();
-	if (normalized === "staged") return { scope: "staged", autoRun: false };
-	if (normalized === "diff") return { scope: "diff", autoRun: false };
-	if (normalized === "fix") return { scope: "full", autoRun: true };
-	return { scope: baseScope as ReviewScope, autoRun: false };
-}
-
-function buildReviewPrompt(settings: Required<AutoReviewSettings>, scope: ReviewScope, autoRun: boolean): string {
-	// If the user provided a custom prompt, use it with minimal framing
+function buildReviewPrompt(
+	settings: Required<AutoReviewSettings>,
+	scope: ReviewScope,
+	autoFix: boolean,
+	triggerReason: string,
+): string {
 	if (settings.prompt) {
 		let prompt = `${REVIEW_MARKER} ${settings.prompt}`;
-		if (autoRun) {
-			prompt += "\n\nAfter updating the todo list, go ahead and fix the problems you found. Work through the items in priority order.";
+		if (autoFix) {
+			prompt += "\n\nAfter updating the todo list, go ahead and fix the problems you found. Work through items in priority order.";
 		}
 		return prompt;
 	}
 
-	// Build the default review prompt
 	const scopeInstruction: Record<ReviewScope, string> = {
 		full: "Review the entire project for problems.",
 		staged: "Review only the staged git changes for problems.",
@@ -141,93 +144,170 @@ function buildReviewPrompt(settings: Required<AutoReviewSettings>, scope: Review
 		? `\nExclude these directories: ${settings.excludePatterns.join(", ")}.`
 		: "";
 
-	const autoRunInstruction = autoRun
-		? `\n\nAfter updating ${settings.todoPath}, go ahead and fix the problems you found. Work through the items in priority order. Cross off items in ${settings.todoPath} as you fix them.`
+	const autoFixInstruction = autoFix
+		? `\n\nAfter updating ${settings.todoPath}, go ahead and fix the problems you found. Work through items in priority order. Cross off items in ${settings.todoPath} as you fix them.`
 		: "";
 
-	return `${REVIEW_MARKER} Run an auto-review of this project. ${scopeInstruction[scope]}${excludeNote}
+	return `${REVIEW_MARKER} Auto-review triggered by: ${triggerReason}. ${scopeInstruction[scope]}${excludeNote}
 
-Use the /skill:auto-review skill for the review methodology. Load it now by reading the SKILL.md file.
+Use the /skill:auto-review skill for the review methodology.
 
-Focus on finding PROBLEMS that need fixing — not features to add. Look for:
+This is a FIX-ONLY review. Do NOT propose features or improvements. ONLY find problems that need fixing:
 - Lint errors, type errors, build failures
 - Failing or missing tests
 - Security vulnerabilities
 - Broken imports or missing dependencies
 - Dead code, unreachable branches
-- TODO/FIXME/HACK comments that indicate known issues
+- TODO/FIXME/HACK comments that indicate known BUGS (not feature ideas)
 - Inconsistencies between code and config
-- Performance bottlenecks
+- Performance problems that are bugs (N+1 queries, memory leaks)
 
 Write your findings to ${settings.todoPath}. Organize by priority:
 - 🔴 Critical — broken build, security issues, data loss risk
 - 🟡 Warning — failing tests, dead code, deprecation issues
-- 🟢 Info — TODOs, style issues, minor improvements
+- 🟢 Info — minor fixes, cleanup of accidental issues
 
-Keep each item actionable and specific. Include file paths and line numbers where possible.${autoRunInstruction}`;
+Keep each item actionable and specific. Include file paths and line numbers where possible.
+Do NOT add feature requests, architecture proposals, or "nice to have" items.${autoFixInstruction}`;
 }
 
-// ── Dirty Repo Check ────────────────────────────────────────────────────────
+// ── Ralph Detection ─────────────────────────────────────────────────────────
 
-async function isDirtyRepo(pi: ExtensionAPI): Promise<boolean> {
-	try {
-		const { stdout, code } = await pi.exec("git", ["status", "--porcelain"]);
-		if (code !== 0) {
-			// Not a git repo or git not available — that's fine, not dirty
-			return false;
+/**
+ * Detect if a Ralph loop just completed by checking agent_end messages
+ * for the Ralph COMPLETE marker or ralph_done tool calls.
+ */
+function isRalphCompletion(messages: Array<{ role: string; content?: string; toolName?: string }>): boolean {
+	for (let i = messages.length - 1; i >= Math.max(0, messages.length - 5); i--) {
+		const msg = messages[i];
+		if (!msg) continue;
+
+		// Check assistant messages for the completion marker
+		if (msg.role === "assistant" && typeof msg.content === "string") {
+			if (msg.content.includes("<promise>COMPLETE</promise>")) {
+				return true;
+			}
 		}
-		return stdout.trim().length > 0;
-	} catch {
-		// git not installed or other failure — skip dirty check
-		return false;
+
+		// Check tool results for ralph_done
+		if (msg.toolName === "ralph_done") {
+			return true;
+		}
 	}
+	return false;
 }
 
 // ── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// Track whether we've already triggered an auto-review this session
-	let hasAutoReviewed = false;
-	// Current settings (refreshed on session start)
-	let currentSettings: Required<AutoReviewSettings> = { ...DEFAULT_SETTINGS };
+	// Cooldown tracking
+	let lastAutoReviewTime = 0;
+	// Turn counter for agent_end threshold
+	let turnCount = 0;
+	// Whether a review is already in-flight (prevent re-triggering)
+	let reviewInFlight = false;
 
-	// ── Session Start: check auto-trigger conditions ─────────────────────
+	function shouldTrigger(settings: Required<AutoReviewSettings>): boolean {
+		if (reviewInFlight) return false;
+		const now = Date.now();
+		if (now - lastAutoReviewTime < settings.cooldownMs) return false;
+		return true;
+	}
+
+	function triggerReview(
+		pi: ExtensionAPI,
+		settings: Required<AutoReviewSettings>,
+		scope: ReviewScope,
+		autoFix: boolean,
+		reason: string,
+	) {
+		if (!shouldTrigger(settings)) return;
+
+		reviewInFlight = true;
+		lastAutoReviewTime = Date.now();
+
+		const prompt = buildReviewPrompt(settings, scope, autoFix, reason);
+
+		// Send as followUp to avoid interrupting any current work
+		pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+
+		// Reset the in-flight flag after a generous timeout
+		setTimeout(() => {
+			reviewInFlight = false;
+		}, 60_000);
+	}
+
+	// ── Session Start ────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		currentSettings = getSettings(ctx.cwd);
-		let shouldReview = false;
+		turnCount = 0;
+		reviewInFlight = false;
+		const settings = getSettings(ctx.cwd);
 
-		// Check onSessionStart trigger
-		if (currentSettings.onSessionStart && !hasAutoReviewed) {
-			shouldReview = true;
-		}
+		if (settings.onSessionStart && shouldTrigger(settings)) {
+			lastAutoReviewTime = Date.now();
+			reviewInFlight = true;
 
-		// Check onDirty trigger
-		if (currentSettings.onDirty && !hasAutoReviewed) {
-			const dirty = await isDirtyRepo(pi);
-			if (dirty) {
-				shouldReview = true;
-			}
-		}
-
-		if (shouldReview) {
-			hasAutoReviewed = true;
 			const prompt = buildReviewPrompt(
-				currentSettings,
-				currentSettings.scope as ReviewScope,
-				currentSettings.autoRun,
+				settings,
+				settings.scope as ReviewScope,
+				settings.autoFix,
+				"session start",
 			);
 
-			if (ctx.hasUI) {
-				ctx.ui.notify("🔍 Auto-review triggered", "info");
-			}
-
-			// Send as follow-up to ensure session is fully initialized
 			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+
+			setTimeout(() => {
+				reviewInFlight = false;
+			}, 60_000);
+
+			if (ctx.hasUI) {
+				ctx.ui.notify("🔍 Auto-review triggered (session start)", "info");
+			}
 		}
 	});
 
-	// ── /review command ──────────────────────────────────────────────────
+	// ── Turn Counting ────────────────────────────────────────────────────
+
+	pi.on("turn_end", async (_event, _ctx) => {
+		turnCount++;
+	});
+
+	// ── Agent End — the primary event-driven trigger ─────────────────────
+	//
+	// This fires after every agent prompt completes. We check:
+	//   1. Was this a Ralph loop completion?  → onRalphDone
+	//   2. Was this a long enough agent run?   → onAgentEnd (with minTurns)
+
+	pi.on("agent_end", async (event, ctx) => {
+		const settings = getSettings(ctx.cwd);
+
+		// Check Ralph completion
+		if (settings.onRalphDone) {
+			const messages = event.messages as Array<{
+				role: string;
+				content?: string;
+				toolName?: string;
+			}>;
+			if (isRalphCompletion(messages)) {
+				if (ctx.hasUI) {
+					ctx.ui.notify("🔍 Ralph loop done — triggering auto-review", "info");
+				}
+				triggerReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, "Ralph loop completion");
+				return; // Don't double-trigger
+			}
+		}
+
+		// Check agent_end with minimum turn threshold
+		if (settings.onAgentEnd && turnCount >= settings.minTurns) {
+			if (ctx.hasUI) {
+				ctx.ui.notify(`🔍 Agent finished (${turnCount} turns) — triggering auto-review`, "info");
+			}
+			triggerReview(pi, settings, settings.scope as ReviewScope, settings.autoFix, `agent end (${turnCount} turns)`);
+		}
+	});
+
+	// ── /review command (manual override) ────────────────────────────────
 
 	pi.registerCommand("review", {
 		description: "Review project for problems and update TODO.md. Use: /review [staged|diff|fix]",
@@ -242,27 +322,34 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const settings = getSettings(ctx.cwd);
-			const { scope, autoRun: cmdAutoRun } = parseReviewArgs(args || "", settings.scope);
-			const effectiveAutoRun = cmdAutoRun || settings.autoRun;
+			const normalized = (args || "").trim().toLowerCase();
 
-			const prompt = buildReviewPrompt(settings, scope, effectiveAutoRun);
+			let scope: ReviewScope = settings.scope as ReviewScope;
+			let autoFix = settings.autoFix;
+
+			if (normalized === "staged") scope = "staged";
+			else if (normalized === "diff") scope = "diff";
+			else if (normalized === "fix") {
+				scope = "full";
+				autoFix = true;
+			}
+
+			const prompt = buildReviewPrompt(settings, scope, autoFix, "manual /review command");
 
 			if (!ctx.isIdle()) {
-				// Queue as follow-up if agent is busy
 				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 				ctx.ui.notify("🔍 Review queued (agent is busy)", "info");
 				return;
 			}
 
 			pi.sendUserMessage(prompt);
-			ctx.ui.notify(`🔍 Review started (${scope}${effectiveAutoRun ? " + auto-fix" : ""})`, "info");
+			ctx.ui.notify(`🔍 Review started (${scope}${autoFix ? " + auto-fix" : ""})`, "info");
 		},
 	});
 
-	// ── System prompt hint when review is active ─────────────────────────
+	// ── System prompt hint for review prompts ───────────────────────────
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		// Only inject system prompt hints for our own review prompts (identified by marker)
 		const text = event.prompt || "";
 		if (!text.includes(REVIEW_MARKER)) return;
 
@@ -270,7 +357,15 @@ export default function (pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				event.systemPrompt +
-				`\n\n[auto-review extension] The user wants a project review. The auto-review skill contains the detailed methodology — load it with /skill:auto-review. Write findings to: ${settings.todoPath}. Focus on problems, not features.`,
+				`\n\n[auto-review extension] This is a fix-only review — do NOT propose features or improvements. The auto-review skill contains the methodology — load /skill:auto-review if needed. Write findings to: ${settings.todoPath}. Organize as 🔴 Critical / 🟡 Warning / 🟢 Info.`,
 		};
+	});
+
+	// ── Reset in-flight flag when review agent ends ─────────────────────
+
+	pi.on("agent_end", async (_event, _ctx) => {
+		// The review prompt triggers its own agent_end; reset the flag
+		// so future auto-reviews can fire
+		reviewInFlight = false;
 	});
 }
