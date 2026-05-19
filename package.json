@@ -1,6 +1,6 @@
 {
   "name": "pi-auto-review",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "description": "Automated project review for Pi — scans for problems, writes TODO.md, and optionally auto-fixes in bounded fix loops",
   "keywords": [
     "pi-package",
